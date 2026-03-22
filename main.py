@@ -46,6 +46,10 @@ OWNER_USER_ID = int(OWNER_USER_ID_RAW) if OWNER_USER_ID_RAW else None
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Berlin").strip() or "Europe/Berlin"
 DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "09:00").strip() or "09:00"
 ALERTS_TIME = os.getenv("ALERTS_TIME", "08:30").strip() or "08:30"
+WEEKLY_SUMMARY_TIME = os.getenv("WEEKLY_SUMMARY_TIME", "09:10").strip() or "09:10"
+WEEKLY_SUMMARY_WEEKDAY = int(os.getenv("WEEKLY_SUMMARY_WEEKDAY", "0"))
+MONTHLY_SUMMARY_TIME = os.getenv("MONTHLY_SUMMARY_TIME", "09:20").strip() or "09:20"
+MONTHLY_SUMMARY_DAY = int(os.getenv("MONTHLY_SUMMARY_DAY", "1"))
 SOON_DAYS = int(os.getenv("SOON_DAYS", "14"))
 BALANCE_WARNING_DAYS = int(os.getenv("BALANCE_WARNING_DAYS", "3"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,7 +64,7 @@ MENU = ReplyKeyboardMarkup(
         ["⏰ Скоро списания", "🪫 Низкий баланс"],
         ["💸 Отметить оплату", "💼 Сводка"],
         ["📈 Отчёт", "🧾 История"],
-        ["⚙️ Помощь"],
+        ["🗃 Архив", "⚙️ Помощь"],
     ],
     resize_keyboard=True,
 )
@@ -85,6 +89,12 @@ KIND_KEYBOARD = ReplyKeyboardMarkup(
 
 BALANCE_MODE_KEYBOARD = ReplyKeyboardMarkup(
     [["Ручной контроль"], ["Фиксированное списание"], ["Средний расход в день"], ["/cancel"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+CATEGORY_KEYBOARD = ReplyKeyboardMarkup(
+    [["Инфраструктура", "Связь"], ["AI/API", "Домены"], ["Маркетинг", "Личное"], ["Прочее", "/cancel"]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -137,6 +147,8 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     ADD_AMOUNT,
     ADD_CURRENCY,
     ADD_PROJECT,
+    ADD_CATEGORY,
+    ADD_TAGS,
     ADD_NEXT_DATE,
     ADD_REMIND_DAYS,
     ADD_REPEAT_UNTIL_PAID,
@@ -154,7 +166,7 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     EDIT_SELECT,
     EDIT_FIELD,
     EDIT_VALUE,
-) = range(22)
+) = range(24)
 
 
 @dataclass
@@ -165,8 +177,10 @@ class Subscription:
     amount: float
     currency: str
     project: str
-    notes: str
-    created_at: datetime
+    category: str = "Прочее"
+    tags: List[str] = field(default_factory=list)
+    notes: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
     active: bool = True
     next_charge_date: Optional[date] = None
     remind_before_days: int = 3
@@ -189,7 +203,8 @@ class ExpenseEvent:
     amount: float
     currency: str
     project: str
-    event_type: str
+    category: str = "Прочее"
+    event_type: str = "payment"
     note: str = ""
 
 
@@ -198,6 +213,7 @@ class UserStore:
     user_id: int
     chat_id: Optional[int] = None
     subscriptions: Dict[str, Subscription] = field(default_factory=dict)
+    archived_subscriptions: Dict[str, Subscription] = field(default_factory=dict)
     history: List[ExpenseEvent] = field(default_factory=list)
     sent_alerts: Dict[str, date] = field(default_factory=dict)
 
@@ -313,6 +329,8 @@ def subscription_to_dict(subscription: Subscription) -> dict:
         "amount": subscription.amount,
         "currency": subscription.currency,
         "project": subscription.project,
+        "category": subscription.category,
+        "tags": subscription.tags,
         "notes": subscription.notes,
         "created_at": datetime_to_iso(subscription.created_at),
         "active": subscription.active,
@@ -342,6 +360,8 @@ def subscription_from_dict(data: dict) -> Subscription:
         amount=float(data["amount"]),
         currency=data["currency"],
         project=data.get("project", "Личное"),
+        category=data.get("category", "Прочее"),
+        tags=[str(item).strip() for item in data.get("tags", []) if str(item).strip()],
         notes=data.get("notes", ""),
         created_at=parse_iso_datetime(data.get("created_at")) or now_local(),
         active=bool(data.get("active", True)),
@@ -367,6 +387,7 @@ def expense_event_to_dict(event: ExpenseEvent) -> dict:
         "amount": event.amount,
         "currency": event.currency,
         "project": event.project,
+        "category": event.category,
         "event_type": event.event_type,
         "note": event.note,
     }
@@ -380,6 +401,7 @@ def expense_event_from_dict(data: dict) -> ExpenseEvent:
         amount=float(data.get("amount", 0)),
         currency=data.get("currency", "USD"),
         project=data.get("project", "Личное"),
+        category=data.get("category", "Прочее"),
         event_type=data.get("event_type", "payment"),
         note=data.get("note", ""),
     )
@@ -390,6 +412,7 @@ def user_store_to_dict(store: UserStore) -> dict:
         "user_id": store.user_id,
         "chat_id": store.chat_id,
         "subscriptions": {key: subscription_to_dict(value) for key, value in store.subscriptions.items()},
+        "archived_subscriptions": {key: subscription_to_dict(value) for key, value in store.archived_subscriptions.items()},
         "history": [expense_event_to_dict(item) for item in store.history],
         "sent_alerts": {key: date_to_iso(value) for key, value in store.sent_alerts.items()},
     }
@@ -398,6 +421,7 @@ def user_store_to_dict(store: UserStore) -> dict:
 def user_store_from_dict(data: dict) -> UserStore:
     store = UserStore(user_id=int(data["user_id"]), chat_id=data.get("chat_id"))
     store.subscriptions = {key: subscription_from_dict(value) for key, value in data.get("subscriptions", {}).items()}
+    store.archived_subscriptions = {key: subscription_from_dict(value) for key, value in data.get("archived_subscriptions", {}).items()}
     store.history = [expense_event_from_dict(item) for item in data.get("history", [])]
     store.sent_alerts = {key: parse_iso_date(value) or today_local() for key, value in data.get("sent_alerts", {}).items()}
     return store
@@ -628,6 +652,163 @@ def get_balance_mode_from_label(label: str) -> Optional[str]:
     return mapping.get(label.strip())
 
 
+
+def normalize_tags(tags: Optional[List[str]]) -> List[str]:
+    if not tags:
+        return []
+    result: List[str] = []
+    seen = set()
+    for item in tags:
+        value = str(item).strip().lstrip('#')
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def parse_tags_input(text: str) -> List[str]:
+    raw = text.strip()
+    if raw == '-' or not raw:
+        return []
+    parts = re.split(r'[,;\n]+', raw)
+    return normalize_tags(parts)
+
+
+def tags_text(subscription: Subscription) -> str:
+    return ', '.join('#' + escape(tag) for tag in normalize_tags(subscription.tags)) if subscription.tags else '—'
+
+
+def current_week_bounds() -> tuple[datetime, datetime]:
+    now = now_local()
+    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return start, end
+
+
+def last_seven_days_bounds() -> tuple[datetime, datetime]:
+    end = now_local()
+    start = end - timedelta(days=7)
+    return start, end
+
+
+def previous_month_bounds() -> tuple[datetime, datetime]:
+    now = now_local()
+    current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    previous_month_end = current_month_start
+    previous_month_last_day = current_month_start - timedelta(days=1)
+    previous_month_start = previous_month_last_day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return previous_month_start, previous_month_end
+
+
+def history_for_period(store: UserStore, start: datetime, end: datetime) -> List[ExpenseEvent]:
+    return [event for event in store.history if start <= event.timestamp < end]
+
+
+def summarize_by_category(events: List[ExpenseEvent]) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, Dict[str, float]] = {}
+    for event in events:
+        grouped.setdefault(event.category, {})
+        grouped[event.category][event.currency] = grouped[event.category].get(event.currency, 0.0) + event.amount
+    return grouped
+
+
+def summarize_subscription_inventory_by_category(subscriptions: List[Subscription]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for subscription in subscriptions:
+        counts[subscription.category] = counts.get(subscription.category, 0) + 1
+    return counts
+
+
+def build_period_summary_lines(store: UserStore, title: str, start: datetime, end: datetime) -> List[str]:
+    events = history_for_period(store, start, end)
+    totals = summarize_amounts(events)
+    by_project = summarize_by_project(events)
+    by_category = summarize_by_category(events)
+    active = active_subscriptions(store)
+    lines = [
+        f'<b>{title}</b>',
+        f'Период: {start.strftime("%d.%m.%Y")} — {(end - timedelta(seconds=1)).strftime("%d.%m.%Y")}',
+        f'Активных подписок: {len(active)}',
+        f'Скоро списаний ({SOON_DAYS} дн.): {len(upcoming_subscriptions(store, SOON_DAYS))}',
+        f'Низкий баланс: {len(low_balance_subscriptions(store))}',
+        f'Потрачено: {format_currency_totals(totals)}',
+        f'Операций: {len(events)}',
+    ]
+    category_inventory = summarize_subscription_inventory_by_category(active)
+    if category_inventory:
+        lines.append('\n<b>Категории подписок</b>')
+        for category, count in sorted(category_inventory.items(), key=lambda item: (-item[1], item[0].lower())):
+            lines.append(f'• {escape(category)} — {count}')
+    if by_project:
+        lines.append('\n<b>Траты по проектам</b>')
+        for project, amounts in sorted(by_project.items()):
+            lines.append(f'• {escape(project)} — {format_currency_totals(amounts)}')
+    if by_category:
+        lines.append('\n<b>Траты по категориям</b>')
+        for category, amounts in sorted(by_category.items()):
+            lines.append(f'• {escape(category)} — {format_currency_totals(amounts)}')
+    return lines
+
+
+def matches_search(subscription: Subscription, query: str) -> bool:
+    haystack = ' | '.join([
+        subscription.id,
+        subscription.name,
+        subscription.project,
+        subscription.category,
+        ' '.join(subscription.tags),
+        subscription.notes,
+        subscription.currency,
+        KIND_LABELS.get(subscription.kind, subscription.kind),
+    ]).casefold()
+    return query.casefold() in haystack
+
+
+def apply_filters(items: List[Subscription], criteria: List[str]) -> List[Subscription]:
+    result = list(items)
+    for criterion in criteria:
+        token = criterion.strip()
+        if not token:
+            continue
+        token_cf = token.casefold()
+        if token_cf in {'active', 'активные'}:
+            result = [item for item in result if item.active]
+            continue
+        if token_cf in {'paused', 'pause', 'напаузе', 'пауза'}:
+            result = [item for item in result if not item.active]
+            continue
+        if token_cf in {'balance', 'monthly', 'yearly'}:
+            result = [item for item in result if item.kind == token_cf]
+            continue
+        if ':' in token:
+            key, value = token.split(':', 1)
+        elif '=' in token:
+            key, value = token.split('=', 1)
+        else:
+            result = [item for item in result if matches_search(item, token)]
+            continue
+        key_cf = key.strip().casefold()
+        value_cf = value.strip().casefold()
+        if key_cf in {'currency', 'валюта'}:
+            result = [item for item in result if item.currency.casefold() == value_cf]
+        elif key_cf in {'project', 'проект'}:
+            result = [item for item in result if value_cf in item.project.casefold()]
+        elif key_cf in {'category', 'категория'}:
+            result = [item for item in result if value_cf in item.category.casefold()]
+        elif key_cf in {'tag', 'тег'}:
+            result = [item for item in result if any(value_cf in tag.casefold() for tag in item.tags)]
+        elif key_cf in {'name', 'название'}:
+            result = [item for item in result if value_cf in item.name.casefold()]
+    return result
+
+
+def archive_count(store: UserStore) -> int:
+    return len(store.archived_subscriptions)
+
 def current_month_bounds() -> tuple[datetime, datetime]:
     now = now_local()
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -822,6 +1003,8 @@ def render_subscription(subscription: Subscription) -> str:
         f"<b>{escape(subscription.name)}</b> [{subscription.id}]",
         f"Тип: {KIND_LABELS[subscription.kind]}",
         f"Проект: {escape(subscription.project)}",
+        f"Категория: {escape(subscription.category)}",
+        f"Теги: {tags_text(subscription)}",
         f"Статус: {subscription_status(subscription)}",
     ]
     if subscription.kind == "balance":
@@ -934,6 +1117,7 @@ def record_history(
             amount=amount,
             currency=subscription.currency,
             project=subscription.project,
+            category=subscription.category,
             event_type=event_type,
             note=note,
         )
@@ -974,6 +1158,17 @@ def build_inline_actions(subscription: Subscription) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"⏯ {pause_text}", callback_data=f"{pause_action}:{subscription.id}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}"),
         ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_archive_actions(subscription: Subscription) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton('♻️ Восстановить', callback_data=f'restore:{subscription.id}'),
+            InlineKeyboardButton('🧾 История', callback_data=f'historysub:{subscription.id}'),
+        ],
+        [InlineKeyboardButton('❌ Удалить навсегда', callback_data=f'purge:{subscription.id}')],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1052,6 +1247,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/edit — изменить подписку\n"
         "/dashboard — общая сводка\n"
         "/report — отчёт за текущий месяц\n"
+        "/weekly — сводка за 7 дней\n"
+        "/monthly — сводка за месяц\n"
+        "/archive — архив подписок\n"
+        "/find текст — поиск по названию, проекту, категории, тегам\n"
+        "/filter критерии — фильтр, например currency:RUB category:AI tag:личное\n"
         "/history — история последних трат\n"
         "/users — кто пользуется ботом\n"
         "/demo — добавить демо-набор подписок\n"
@@ -1127,6 +1327,8 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount=10,
             currency="USD",
             project="Bot A",
+            category="Инфраструктура",
+            tags=["сервер", "prod"],
             notes="Демо ежемесячной подписки",
             created_at=now_local(),
             next_charge_date=today + timedelta(days=3),
@@ -1139,6 +1341,8 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount=30,
             currency="USD",
             project="Все проекты",
+            category="AI/API",
+            tags=["openai", "api"],
             notes="Демо балансового сервиса с ежедневным расходом",
             created_at=now_local(),
             current_balance=25,
@@ -1154,6 +1358,8 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount=1000,
             currency="RUB",
             project="Личное",
+            category="Связь",
+            tags=["симка", "мобильный"],
             notes="Демо фиксированного списания",
             created_at=now_local(),
             current_balance=850,
@@ -1170,6 +1376,8 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount=12,
             currency="USD",
             project="Bot A",
+            category="Домены",
+            tags=["домен"],
             notes="Демо годовой подписки",
             created_at=now_local(),
             next_charge_date=today + timedelta(days=25),
@@ -1270,6 +1478,30 @@ async def add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ADD_PROJECT
     pending = context.user_data["pending_subscription"]
     pending["project"] = project
+    await update.message.reply_text(
+        "Выбери категорию подписки или введи свою.",
+        reply_markup=CATEGORY_KEYBOARD,
+    )
+    return ADD_CATEGORY
+
+
+async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    category = update.message.text.strip()
+    if len(category) < 1:
+        await update.message.reply_text("Категория не должна быть пустой.", reply_markup=CATEGORY_KEYBOARD)
+        return ADD_CATEGORY
+    pending = context.user_data["pending_subscription"]
+    pending["category"] = category
+    await update.message.reply_text(
+        "Добавь теги через запятую или отправь '-' чтобы пропустить.\nНапример: сервер, prod",
+        reply_markup=YES_SKIP_KEYBOARD,
+    )
+    return ADD_TAGS
+
+
+async def add_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pending = context.user_data["pending_subscription"]
+    pending["tags"] = parse_tags_input(update.message.text)
     if pending["kind"] == "balance":
         await update.message.reply_text(
             "Введи текущий баланс сервиса.",
@@ -1434,6 +1666,8 @@ async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         amount=pending["amount"],
         currency=pending["currency"],
         project=pending["project"],
+        category=pending.get("category", "Прочее"),
+        tags=normalize_tags(pending.get("tags")),
         notes=notes,
         created_at=now_local(),
         next_charge_date=pending.get("next_charge_date"),
@@ -1472,7 +1706,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     paused = [sub for sub in store.subscriptions.values() if not sub.active]
 
     await update.message.reply_text(
-        f"Всего подписок: {len(store.subscriptions)} | Активных: {len(active)} | На паузе: {len(paused)}",
+        f"Всего подписок: {len(store.subscriptions)} | Активных: {len(active)} | На паузе: {len(paused)} | В архиве: {archive_count(store)}",
         reply_markup=MENU,
     )
     for subscription in sorted(
@@ -1593,7 +1827,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         label = EVENT_TYPE_LABELS.get(event.event_type, event.event_type)
         lines.append(
             f"• {event.timestamp.strftime('%d.%m %H:%M')} — {escape(event.subscription_name)} — "
-            f"{format_money(event.amount, event.currency)} ({label})"
+            f"{format_money(event.amount, event.currency)} ({label}, {escape(event.category)})"
         )
     await update.message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
@@ -1610,6 +1844,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     total = len(store.subscriptions)
     active_total = len(active_subscriptions(store))
     paused_total = total - active_total
+    archived_total = archive_count(store)
     due_soon = len(upcoming_subscriptions(store, 7))
     low_balance = len(low_balance_subscriptions(store))
     forecast_warning = len(balance_warning_subscriptions(store, BALANCE_WARNING_DAYS))
@@ -1622,11 +1857,17 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Подписок всего: {total}",
         f"Активных: {active_total}",
         f"На паузе: {paused_total}",
+        f"В архиве: {archived_total}",
         f"Скоро списаний (7 дн.): {due_soon}",
         f"Низкий баланс: {low_balance}",
         f"До порога примерно за {BALANCE_WARNING_DAYS} дн.: {forecast_warning}",
         f"Потрачено в этом месяце: {format_currency_totals(month_totals)}",
     ]
+    categories = summarize_subscription_inventory_by_category(active_subscriptions(store))
+    if categories:
+        lines.append("\n<b>Категории</b>")
+        for category, count in sorted(categories.items(), key=lambda item: (-item[1], item[0].lower()))[:5]:
+            lines.append(f"• {escape(category)} — {count}")
     if top_soon:
         lines.append("\n<b>Ближайшие оплаты</b>")
         for subscription in top_soon:
@@ -1657,6 +1898,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     totals = summarize_amounts(events)
     grouped = summarize_by_project(events)
+    by_category = summarize_by_category(events)
 
     lines = [
         f"<b>Отчёт за {now_local().strftime('%m.%Y')}</b>",
@@ -1666,10 +1908,104 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
     for project, amounts in sorted(grouped.items()):
         lines.append(f"• {escape(project)} — {format_currency_totals(amounts)}")
+    if by_category:
+        lines.append("\n<b>По категориям</b>")
+        for category, amounts in sorted(by_category.items()):
+            lines.append(f"• {escape(category)} — {format_currency_totals(amounts)}")
 
     await update.message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
     )
+
+
+async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    if not store.archived_subscriptions:
+        await update.message.reply_text('Архив пуст.', reply_markup=MENU)
+        return
+    await update.message.reply_text(f'В архиве: {len(store.archived_subscriptions)}', reply_markup=MENU)
+    for subscription in sorted(store.archived_subscriptions.values(), key=lambda item: item.name.lower()):
+        await update.message.reply_text(
+            render_subscription(subscription),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_archive_actions(subscription),
+        )
+
+
+async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    start, end = last_seven_days_bounds()
+    lines = build_period_summary_lines(store, 'Сводка за 7 дней', start, end)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    start, end = current_month_bounds()
+    lines = build_period_summary_lines(store, 'Сводка за месяц', start, end)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    query = ' '.join(context.args).strip()
+    if not query:
+        await update.message.reply_text('Используй: /find текст', reply_markup=MENU)
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    active = [item for item in store.subscriptions.values() if matches_search(item, query)]
+    archived = [item for item in store.archived_subscriptions.values() if matches_search(item, query)]
+    if not active and not archived:
+        await update.message.reply_text('Ничего не нашёл.', reply_markup=MENU)
+        return
+    await update.message.reply_text(
+        f'Найдено: активных {len(active)}, архивных {len(archived)}',
+        reply_markup=MENU,
+    )
+    for subscription in sorted(active, key=lambda item: item.name.lower()):
+        await update.message.reply_text(render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=build_inline_actions(subscription))
+    for subscription in sorted(archived, key=lambda item: item.name.lower()):
+        await update.message.reply_text('🗃 Архив\n' + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=build_archive_actions(subscription))
+
+
+async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    criteria = context.args
+    if not criteria:
+        await update.message.reply_text(
+            'Используй: /filter active | /filter currency:RUB | /filter category:AI/API | /filter tag:сервер | /filter project:Личное',
+            reply_markup=MENU,
+        )
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    include_archived = any(arg.casefold() in {'archived', 'архив'} for arg in criteria)
+    pool = list(store.archived_subscriptions.values()) if include_archived else list(store.subscriptions.values())
+    matches = apply_filters(pool, [arg for arg in criteria if arg.casefold() not in {'archived', 'архив'}])
+    if not matches:
+        await update.message.reply_text('По фильтру ничего не нашёл.', reply_markup=MENU)
+        return
+    await update.message.reply_text(f'Найдено по фильтру: {len(matches)}', reply_markup=MENU)
+    for subscription in sorted(matches, key=lambda item: (not item.active, item.name.lower())):
+        markup = build_archive_actions(subscription) if include_archived else build_inline_actions(subscription)
+        await update.message.reply_text(render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1729,7 +2065,7 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     subscription_id = context.user_data.get("pending_payment_id")
-    subscription = store.subscriptions.get(subscription_id)
+    subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
     if subscription is None:
         await update.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
         return ConversationHandler.END
@@ -1882,9 +2218,15 @@ async def subscription_action_callback(update: Update, context: ContextTypes.DEF
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
-    subscription = store.subscriptions.get(subscription_id)
+    active_subscription = store.subscriptions.get(subscription_id)
+    archived_subscription = store.archived_subscriptions.get(subscription_id)
+    subscription = active_subscription or archived_subscription
     if subscription is None:
         await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
+        return
+
+    if archived_subscription is not None and active_subscription is None and action not in {"restore", "purge"}:
+        await query.message.reply_text("Эта подписка уже в архиве. Используй восстановление или удаление навсегда.", reply_markup=MENU)
         return
 
     if action == "pause":
@@ -1897,8 +2239,19 @@ async def subscription_action_callback(update: Update, context: ContextTypes.DEF
         subscription.snoozed_until = today_local() + timedelta(days=1)
         text = f"Отложил напоминания до {subscription.snoozed_until.strftime('%d.%m.%Y')}: {subscription.name}"
     elif action == "delete":
-        del store.subscriptions[subscription_id]
-        text = f"Удалил: {subscription.name}"
+        store.subscriptions.pop(subscription_id, None)
+        subscription.active = False
+        subscription.snoozed_until = None
+        store.archived_subscriptions[subscription_id] = subscription
+        text = f"Перенёс в архив: {subscription.name}"
+    elif action == "restore":
+        store.archived_subscriptions.pop(subscription_id, None)
+        subscription.active = True
+        store.subscriptions[subscription_id] = subscription
+        text = f"Восстановил из архива: {subscription.name}"
+    elif action == "purge":
+        store.archived_subscriptions.pop(subscription_id, None)
+        text = f"Удалил навсегда из архива: {subscription.name}"
     else:
         text = "Неизвестное действие."
 
@@ -1915,14 +2268,15 @@ async def show_subscription_history_callback(update: Update, context: ContextTyp
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
-    subscription = store.subscriptions.get(subscription_id)
+    subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
     if subscription is None:
         await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
         return
+    markup = build_inline_actions(subscription) if subscription_id in store.subscriptions else build_archive_actions(subscription)
     await query.message.reply_text(
         subscription_history_text(store, subscription),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_inline_actions(subscription),
+        reply_markup=markup,
     )
 
 
@@ -1931,6 +2285,10 @@ def build_edit_keyboard(subscription: Subscription) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Название", callback_data=f"editfield:name:{subscription.id}"),
             InlineKeyboardButton("Проект", callback_data=f"editfield:project:{subscription.id}"),
+        ],
+        [
+            InlineKeyboardButton("Категория", callback_data=f"editfield:category:{subscription.id}"),
+            InlineKeyboardButton("Теги", callback_data=f"editfield:tags:{subscription.id}"),
         ],
         [
             InlineKeyboardButton("Сумма", callback_data=f"editfield:amount:{subscription.id}"),
@@ -1965,6 +2323,8 @@ def edit_field_prompt(field_name: str, subscription: Subscription) -> str:
     prompts = {
         "name": "Введи новое название.",
         "project": "Введи новый проект.",
+        "category": "Введи новую категорию.",
+        "tags": "Введи теги через запятую или '-' чтобы очистить.",
         "amount": "Введи новую сумму.",
         "currency": "Введи валюту: KZT, RUB, EUR, USD или TRY.",
         "notes": "Введи новую заметку или '-' чтобы очистить.",
@@ -2071,10 +2431,12 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     raw = update.message.text.strip()
     try:
-        if field_name in {"name", "project"}:
+        if field_name in {"name", "project", "category"}:
             if not raw:
                 raise ValueError("Значение не должно быть пустым.")
             setattr(subscription, field_name, raw)
+        elif field_name == "tags":
+            subscription.tags = parse_tags_input(raw)
         elif field_name == "amount":
             value = parse_float(raw)
             if value is None:
@@ -2164,6 +2526,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "💼 Сводка": dashboard_command,
         "📈 Отчёт": report_command,
         "🧾 История": history_command,
+        "🗃 Архив": archive_command,
         "⚙️ Помощь": help_command,
     }
     handler = routes.get(text)
@@ -2280,6 +2643,26 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for store in RUNTIME_USERS.values():
+        if store.chat_id is None:
+            continue
+        start, end = last_seven_days_bounds()
+        lines = build_period_summary_lines(store, 'Еженедельная сводка', start, end)
+        await context.bot.send_message(chat_id=store.chat_id, text='\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def monthly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if today_local().day != MONTHLY_SUMMARY_DAY:
+        return
+    for store in RUNTIME_USERS.values():
+        if store.chat_id is None:
+            continue
+        start, end = previous_month_bounds()
+        lines = build_period_summary_lines(store, 'Месячная сводка', start, end)
+        await context.bot.send_message(chat_id=store.chat_id, text='\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGGER.exception("Unhandled error: %s", context.error)
     if isinstance(update, Update):
@@ -2303,6 +2686,8 @@ def add_handlers(application: Application) -> None:
             ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amount)],
             ADD_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_currency)],
             ADD_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_project)],
+            ADD_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_category)],
+            ADD_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_tags)],
             ADD_NEXT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_next_date)],
             ADD_REMIND_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_remind_days)],
             ADD_REPEAT_UNTIL_PAID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_repeat_until_paid)],
@@ -2380,7 +2765,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(edit_conversation)
     application.add_handler(CallbackQueryHandler(show_subscription_history_callback, pattern=r"^historysub:"))
     application.add_handler(
-        CallbackQueryHandler(subscription_action_callback, pattern=r"^(pause|resume|delete|snooze):")
+        CallbackQueryHandler(subscription_action_callback, pattern=r"^(pause|resume|delete|snooze|restore|purge):")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
     application.add_error_handler(error_handler)
@@ -2398,6 +2783,17 @@ def schedule_jobs(application: Application) -> None:
         daily_summary_job,
         time=parse_hhmm(DAILY_SUMMARY_TIME),
         name="daily_summary_job",
+    )
+    application.job_queue.run_weekly(
+        weekly_summary_job,
+        time=parse_hhmm(WEEKLY_SUMMARY_TIME),
+        days=(WEEKLY_SUMMARY_WEEKDAY,),
+        name="weekly_summary_job",
+    )
+    application.job_queue.run_daily(
+        monthly_summary_job,
+        time=parse_hhmm(MONTHLY_SUMMARY_TIME),
+        name="monthly_summary_job",
     )
 
 
