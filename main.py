@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import warnings
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -15,6 +16,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from telegram.warnings import PTBUserWarning
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -42,6 +44,14 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger("subscription_bot")
+
+# Suppress a noisy PTB warning for mixed message/callback conversations.
+# The bot intentionally starts some conversations from inline buttons and continues in chat.
+warnings.filterwarnings(
+    "ignore",
+    message=r"If 'per_message=False'.*CallbackQueryHandler.*",
+    category=PTBUserWarning,
+)
 
 TOKEN = os.getenv("TG_BOT_API_KEY", "").strip()
 OWNER_USER_ID_RAW = os.getenv("OWNER_USER_ID", "").strip()
@@ -638,6 +648,20 @@ def parse_date_input(text: str) -> Optional[date]:
 def parse_hhmm(value: str) -> time:
     hour_str, minute_str = value.split(":", maxsplit=1)
     return time(hour=int(hour_str), minute=int(minute_str), tzinfo=TZ)
+
+
+def normalize_weekly_weekday(value: int) -> int:
+    """Convert a human-friendly Monday=0..Sunday=6 value to PTB Sunday=0..Saturday=6."""
+    normalized = value % 7
+    return (normalized + 1) % 7
+
+
+def clamp_month_day(value: int) -> int:
+    if value < 1:
+        return 1
+    if value > 31:
+        return 31
+    return value
 
 
 def get_kind_from_label(label: str) -> Optional[str]:
@@ -3189,8 +3213,6 @@ async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def monthly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if today_local().day != MONTHLY_SUMMARY_DAY:
-        return
     for store in RUNTIME_USERS.values():
         if store.chat_id is None:
             continue
@@ -3253,6 +3275,7 @@ def add_handlers(application: Application) -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
         name="pay_subscription",
         persistent=False,
+        per_message=False,
     )
 
     balance_conversation = ConversationHandler(
@@ -3267,6 +3290,7 @@ def add_handlers(application: Application) -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
         name="set_balance",
         persistent=False,
+        per_message=False,
     )
 
 
@@ -3283,6 +3307,7 @@ def add_handlers(application: Application) -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
         name="edit_subscription",
         persistent=False,
+        per_message=False,
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -3319,7 +3344,12 @@ def add_handlers(application: Application) -> None:
 
 def schedule_jobs(application: Application) -> None:
     if application.job_queue is None:
+        LOGGER.warning("JobQueue is not available; scheduled reminders are disabled")
         return
+
+    weekly_ptb_day = normalize_weekly_weekday(WEEKLY_SUMMARY_WEEKDAY)
+    monthly_day = clamp_month_day(MONTHLY_SUMMARY_DAY)
+
     application.job_queue.run_daily(
         alerts_job,
         time=parse_hhmm(ALERTS_TIME),
@@ -3330,16 +3360,27 @@ def schedule_jobs(application: Application) -> None:
         time=parse_hhmm(DAILY_SUMMARY_TIME),
         name="daily_summary_job",
     )
-    application.job_queue.run_weekly(
+    application.job_queue.run_daily(
         weekly_summary_job,
         time=parse_hhmm(WEEKLY_SUMMARY_TIME),
-        days=(WEEKLY_SUMMARY_WEEKDAY,),
+        days=(weekly_ptb_day,),
         name="weekly_summary_job",
     )
-    application.job_queue.run_daily(
+    application.job_queue.run_monthly(
         monthly_summary_job,
-        time=parse_hhmm(MONTHLY_SUMMARY_TIME),
+        when=parse_hhmm(MONTHLY_SUMMARY_TIME),
+        day=monthly_day,
         name="monthly_summary_job",
+    )
+    LOGGER.info(
+        "Scheduled jobs: alerts=%s daily=%s weekly=%s (env weekday=%s -> ptb weekday=%s) monthly=%s day=%s",
+        ALERTS_TIME,
+        DAILY_SUMMARY_TIME,
+        WEEKLY_SUMMARY_TIME,
+        WEEKLY_SUMMARY_WEEKDAY,
+        weekly_ptb_day,
+        MONTHLY_SUMMARY_TIME,
+        monthly_day,
     )
 
 

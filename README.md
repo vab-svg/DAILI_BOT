@@ -141,3 +141,9 @@ DATA_FILE=subscription_data.json
 
 JSON-хранилище локальное. Если среда деплоя полностью пересоздаётся, файл может исчезнуть.
 Для Railway это лучше, чем хранение только в памяти, но хуже, чем SQLite/Postgres.
+
+
+## Fix for Railway/PTB 22.7
+- Weekly summary scheduling now uses `run_daily(..., days=(...))`, because PTB 22.7 has `run_daily` and `run_monthly`, but no `run_weekly`.
+- `WEEKLY_SUMMARY_WEEKDAY` is interpreted as Monday=0 ... Sunday=6 and converted internally for PTB.
+- Monthly summary now uses `run_monthly`.
