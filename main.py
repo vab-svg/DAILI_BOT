@@ -174,6 +174,8 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     ADD_SPEND_AMOUNT,
     ADD_SPEND_PERIOD,
     ADD_NOTES,
+    ADD_SITE_URL,
+    ADD_PAYMENT_URL,
     PAY_SELECT,
     PAY_AMOUNT,
     PAY_BALANCE,
@@ -182,7 +184,7 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     EDIT_SELECT,
     EDIT_FIELD,
     EDIT_VALUE,
-) = range(24)
+) = range(26)
 
 
 @dataclass
@@ -209,6 +211,8 @@ class Subscription:
     reminder_offsets: List[int] = field(default_factory=lambda: DEFAULT_REMINDER_OFFSETS.copy())
     repeat_daily_until_paid: bool = True
     snoozed_until: Optional[date] = None
+    site_url: str = ""
+    payment_url: str = ""
 
 
 @dataclass
@@ -336,6 +340,23 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return None
     return datetime.fromisoformat(value)
 
+def clean_optional_url(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if raw in {"", "-", "—"}:
+        return ""
+    if not re.match(r"^https?://", raw, flags=re.IGNORECASE):
+        raise ValueError("Ссылка должна начинаться с http:// или https://, либо отправь '-' чтобы пропустить.")
+    return raw
+
+
+def build_link_buttons(subscription: "Subscription") -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    if subscription.payment_url:
+        rows.append([InlineKeyboardButton("🌐 Оплатить", url=subscription.payment_url)])
+    if subscription.site_url:
+        rows.append([InlineKeyboardButton("🔗 Открыть сайт", url=subscription.site_url)])
+    return rows
+
 
 def subscription_to_dict(subscription: Subscription) -> dict:
     return {
@@ -361,6 +382,8 @@ def subscription_to_dict(subscription: Subscription) -> dict:
         "reminder_offsets": current_reminder_offsets(subscription),
         "repeat_daily_until_paid": subscription.repeat_daily_until_paid,
         "snoozed_until": date_to_iso(subscription.snoozed_until),
+        "site_url": subscription.site_url,
+        "payment_url": subscription.payment_url,
     }
 
 
@@ -392,6 +415,8 @@ def subscription_from_dict(data: dict) -> Subscription:
         reminder_offsets=normalize_reminder_offsets(reminder_offsets),
         repeat_daily_until_paid=bool(data.get("repeat_daily_until_paid", True)),
         snoozed_until=parse_iso_date(data.get("snoozed_until")),
+        site_url=data.get("site_url", "") or "",
+        payment_url=data.get("payment_url", "") or "",
     )
 
 
@@ -1142,7 +1167,7 @@ def subscriptions_csv_text(store: UserStore) -> str:
         "source", "id", "name", "kind", "amount", "currency", "project", "category", "tags", "notes",
         "active", "next_charge_date", "remind_before_days", "reminder_offsets", "repeat_daily_until_paid",
         "current_balance", "min_balance", "balance_updated_at", "spending_mode", "spend_amount",
-        "spend_period_days", "snoozed_until",
+        "spend_period_days", "snoozed_until", "site_url", "payment_url",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
@@ -1171,6 +1196,8 @@ def subscriptions_csv_text(store: UserStore) -> str:
                 "spend_amount": "" if subscription.spend_amount is None else subscription.spend_amount,
                 "spend_period_days": "" if subscription.spend_period_days is None else subscription.spend_period_days,
                 "snoozed_until": date_to_iso(subscription.snoozed_until) or "",
+                "site_url": subscription.site_url,
+                "payment_url": subscription.payment_url,
             })
     return output.getvalue()
 
@@ -1216,6 +1243,8 @@ def subscription_from_csv_row(row: dict) -> Subscription:
         reminder_offsets=normalize_reminder_offsets(reminder_offsets or [int(row.get("remind_before_days") or 3), 0]),
         repeat_daily_until_paid=parse_boolish(str(row.get("repeat_daily_until_paid", "1")), True),
         snoozed_until=parse_iso_date((row.get("snoozed_until") or "").strip()),
+        site_url=(row.get("site_url") or "").strip(),
+        payment_url=(row.get("payment_url") or "").strip(),
     )
     return subscription
 
@@ -1470,6 +1499,10 @@ def render_subscription(subscription: Subscription) -> str:
         lines.append(f"Напоминания отложены до: {subscription.snoozed_until.strftime('%d.%m.%Y')}")
     if subscription.notes:
         lines.append(f"Заметка: {escape(subscription.notes)}")
+    if subscription.payment_url:
+        lines.append(f"Оплата: {escape(subscription.payment_url)}")
+    if subscription.site_url:
+        lines.append(f"Сайт: {escape(subscription.site_url)}")
     return "\n".join(lines)
 
 
@@ -1576,8 +1609,9 @@ def build_inline_actions(subscription: Subscription) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⏰ Отложить", callback_data=f"snooze:{subscription.id}"),
                 InlineKeyboardButton(f"⏯ {pause_text}", callback_data=f"{pause_action}:{subscription.id}"),
             ],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}")],
         ]
+        rows.extend(build_link_buttons(subscription))
+        rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}")])
         return InlineKeyboardMarkup(rows)
 
     rows = [
@@ -1594,6 +1628,7 @@ def build_inline_actions(subscription: Subscription) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}"),
         ],
     ]
+    rows.extend(build_link_buttons(subscription))
     return InlineKeyboardMarkup(rows)
 
 
@@ -2092,12 +2127,41 @@ async def add_spend_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pending = context.user_data["pending_subscription"]
+    pending["notes"] = "" if update.message.text.strip() == "-" else update.message.text.strip()
+    await update.message.reply_text(
+        "Отправь ссылку на сайт или личный кабинет сервиса. Если не нужно — отправь '-'.",
+        reply_markup=YES_SKIP_KEYBOARD,
+    )
+    return ADD_SITE_URL
+
+
+async def add_site_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        context.user_data["pending_subscription"]["site_url"] = clean_optional_url(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=YES_SKIP_KEYBOARD)
+        return ADD_SITE_URL
+    await update.message.reply_text(
+        "Отправь прямую ссылку на оплату. Если не нужно — отправь '-'.",
+        reply_markup=YES_SKIP_KEYBOARD,
+    )
+    return ADD_PAYMENT_URL
+
+
+async def add_payment_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        payment_url = clean_optional_url(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=YES_SKIP_KEYBOARD)
+        return ADD_PAYMENT_URL
+
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     pending = context.user_data.pop("pending_subscription", {})
+    pending["payment_url"] = payment_url
 
-    notes = "" if update.message.text.strip() == "-" else update.message.text.strip()
     subscription = Subscription(
         id=uuid4().hex[:8],
         name=pending["name"],
@@ -2107,7 +2171,7 @@ async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         project=pending["project"],
         category=pending.get("category", "Прочее"),
         tags=normalize_tags(pending.get("tags")),
-        notes=notes,
+        notes=pending.get("notes", ""),
         created_at=now_local(),
         next_charge_date=pending.get("next_charge_date"),
         remind_before_days=(pending.get("reminder_offsets") or [3])[0],
@@ -2119,6 +2183,8 @@ async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         spend_period_days=pending.get("spend_period_days"),
         reminder_offsets=normalize_reminder_offsets(pending.get("reminder_offsets")),
         repeat_daily_until_paid=pending.get("repeat_daily_until_paid", True),
+        site_url=pending.get("site_url", ""),
+        payment_url=pending.get("payment_url", ""),
     )
     store.subscriptions[subscription.id] = subscription
     save_state()
@@ -2852,6 +2918,10 @@ def build_edit_keyboard(subscription: Subscription) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Валюта", callback_data=f"editfield:currency:{subscription.id}"),
         ],
         [InlineKeyboardButton("Заметка", callback_data=f"editfield:notes:{subscription.id}")],
+        [
+            InlineKeyboardButton("Сайт", callback_data=f"editfield:site_url:{subscription.id}"),
+            InlineKeyboardButton("Ссылка на оплату", callback_data=f"editfield:payment_url:{subscription.id}"),
+        ],
     ]
     if subscription.kind == "balance":
         rows.extend([
@@ -2885,6 +2955,8 @@ def edit_field_prompt(field_name: str, subscription: Subscription) -> str:
         "amount": "Введи новую сумму.",
         "currency": "Введи валюту: KZT, RUB, EUR, USD или TRY.",
         "notes": "Введи новую заметку или '-' чтобы очистить.",
+        "site_url": "Введи ссылку на сайт или '-' чтобы очистить.",
+        "payment_url": "Введи ссылку на оплату или '-' чтобы очистить.",
         "next_charge_date": "Введи новую дату списания. Формат: DD.MM.YYYY или YYYY-MM-DD",
         "reminders": "Введи дни напоминаний через запятую. Пример: 7,3,1,0",
         "repeat": "Повторять просрочку ежедневно? Ответь Да или Нет.",
@@ -2970,7 +3042,7 @@ async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
         return ConversationHandler.END
     prompt = edit_field_prompt(field_name, subscription)
-    reply_markup = CURRENCY_KEYBOARD if field_name == "currency" else YES_NO_KEYBOARD if field_name == "repeat" else ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True)
+    reply_markup = CURRENCY_KEYBOARD if field_name == "currency" else YES_NO_KEYBOARD if field_name == "repeat" else YES_SKIP_KEYBOARD if field_name in {"site_url", "payment_url", "notes"} else ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True)
     await query.message.reply_text(prompt, reply_markup=reply_markup)
     return EDIT_VALUE
 
@@ -3006,6 +3078,10 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             subscription.currency = value
         elif field_name == "notes":
             subscription.notes = "" if raw == "-" else raw
+        elif field_name == "site_url":
+            subscription.site_url = clean_optional_url(raw) or ""
+        elif field_name == "payment_url":
+            subscription.payment_url = clean_optional_url(raw) or ""
         elif field_name == "next_charge_date":
             value = parse_date_input(raw)
             if value is None:
@@ -3255,6 +3331,8 @@ def add_handlers(application: Application) -> None:
             ADD_SPEND_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_spend_amount)],
             ADD_SPEND_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_spend_period)],
             ADD_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_notes)],
+            ADD_SITE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_site_url)],
+            ADD_PAYMENT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="add_subscription",
