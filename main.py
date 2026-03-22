@@ -38,10 +38,29 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("subscription_bot")
 
+SUPPORTED_CURRENCIES = {
+    "KZT": {"label": "₸ Тенге (KZT)", "aliases": {"KZT", "₸", "ТЕНГЕ", "ТГ", "TENGE"}},
+    "RUB": {"label": "₽ Рубли (RUB)", "aliases": {"RUB", "₽", "РУБ", "РУБЛИ", "RUBLE", "RUBLES"}},
+    "EUR": {"label": "€ Евро (EUR)", "aliases": {"EUR", "€", "ЕВРО", "EURO"}},
+    "USD": {"label": "$ Доллары (USD)", "aliases": {"USD", "$", "ДОЛЛАР", "ДОЛЛАРЫ", "DOLLAR", "DOLLARS"}},
+    "TRY": {"label": "₺ Лиры (TRY)", "aliases": {"TRY", "₺", "ЛИРА", "ЛИРЫ", "ТУРЕЦКАЯ ЛИРА", "ТУРЕЦКИЕ ЛИРЫ", "LIRA", "LIRAS", "TURKISH LIRA"}},
+}
+
+
+def normalize_currency_code(raw: str) -> Optional[str]:
+    cleaned = raw.strip().upper()
+    if not cleaned:
+        return None
+    for code, config in SUPPORTED_CURRENCIES.items():
+        if cleaned == code or cleaned in config["aliases"]:
+            return code
+    return None
+
+
 TOKEN = os.getenv("TG_BOT_API_KEY", "").strip()
 OWNER_USER_ID_RAW = os.getenv("OWNER_USER_ID", "").strip()
 OWNER_USER_ID = int(OWNER_USER_ID_RAW) if OWNER_USER_ID_RAW else None
-DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "USD").strip() or "USD"
+DEFAULT_CURRENCY = normalize_currency_code(os.getenv("DEFAULT_CURRENCY", "USD")) or "USD"
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Berlin").strip() or "Europe/Berlin"
 DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "09:00").strip() or "09:00"
 ALERTS_TIME = os.getenv("ALERTS_TIME", "08:30").strip() or "08:30"
@@ -68,6 +87,12 @@ KIND_LABELS = {
 
 KIND_KEYBOARD = ReplyKeyboardMarkup(
     [["Ежемесячная", "Годовая"], ["Балансовый сервис"], ["/cancel"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
+    [["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"], ["/cancel"]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -449,7 +474,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/report — отчёт за текущий месяц\n"
         "/history — история последних трат\n"
         "/demo — добавить демо-набор подписок\n"
-        "/cancel — отменить текущий диалог"
+        "/cancel — отменить текущий диалог\n\n"
+        "Поддерживаемые валюты: KZT (тенге), RUB (рубли), EUR (евро), USD (доллары), TRY (лиры)."
     )
     await update.message.reply_text(text, reply_markup=MENU)
 
@@ -560,18 +586,19 @@ async def add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ADD_AMOUNT
     context.user_data["pending_subscription"]["amount"] = amount
     await update.message.reply_text(
-        f"Введи валюту. Например: {DEFAULT_CURRENCY}",
-        reply_markup=ReplyKeyboardMarkup(
-            [[DEFAULT_CURRENCY, "/cancel"]], resize_keyboard=True, one_time_keyboard=True
-        ),
+        f"Выбери валюту кнопкой ниже. По умолчанию: {DEFAULT_CURRENCY}. Поддерживаются тенге, рубли, евро, доллары и лиры.",
+        reply_markup=CURRENCY_KEYBOARD,
     )
     return ADD_CURRENCY
 
 
 async def add_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    currency = update.message.text.strip().upper()
-    if len(currency) < 1 or len(currency) > 10:
-        await update.message.reply_text("Валюта выглядит странно. Пример: USD, EUR, RUB")
+    currency = normalize_currency_code(update.message.text)
+    if currency is None:
+        await update.message.reply_text(
+            "Выбери одну из доступных валют: KZT, RUB, EUR, USD или TRY.",
+            reply_markup=CURRENCY_KEYBOARD,
+        )
         return ADD_CURRENCY
     context.user_data["pending_subscription"]["currency"] = currency
     await update.message.reply_text(
