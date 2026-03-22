@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import re
 from calendar import monthrange
@@ -14,7 +15,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -45,6 +45,7 @@ TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Berlin").strip() or "Europe/Berlin
 DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "09:00").strip() or "09:00"
 ALERTS_TIME = os.getenv("ALERTS_TIME", "08:30").strip() or "08:30"
 SOON_DAYS = int(os.getenv("SOON_DAYS", "14"))
+BALANCE_WARNING_DAYS = int(os.getenv("BALANCE_WARNING_DAYS", "3"))
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
@@ -65,8 +66,20 @@ KIND_LABELS = {
     "balance": "Балансовый сервис",
 }
 
+BALANCE_MODE_LABELS = {
+    "manual": "Ручной контроль",
+    "fixed": "Фиксированное списание",
+    "daily_avg": "Средний расход в день",
+}
+
 KIND_KEYBOARD = ReplyKeyboardMarkup(
     [["Ежемесячная", "Годовая"], ["Балансовый сервис"], ["/cancel"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+BALANCE_MODE_KEYBOARD = ReplyKeyboardMarkup(
+    [["Ручной контроль"], ["Фиксированное списание"], ["Средний расход в день"], ["/cancel"]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -119,13 +132,16 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     ADD_REMIND_DAYS,
     ADD_CURRENT_BALANCE,
     ADD_MIN_BALANCE,
+    ADD_BALANCE_MODE,
+    ADD_SPEND_AMOUNT,
+    ADD_SPEND_PERIOD,
     ADD_NOTES,
     PAY_SELECT,
     PAY_AMOUNT,
     PAY_BALANCE,
     BALANCE_SELECT,
     BALANCE_VALUE,
-) = range(15)
+) = range(18)
 
 
 @dataclass
@@ -143,6 +159,10 @@ class Subscription:
     remind_before_days: int = 3
     current_balance: Optional[float] = None
     min_balance: Optional[float] = None
+    balance_updated_at: Optional[date] = None
+    spending_mode: Optional[str] = None
+    spend_amount: Optional[float] = None
+    spend_period_days: Optional[int] = None
 
 
 @dataclass
@@ -266,6 +286,15 @@ def get_kind_from_label(label: str) -> Optional[str]:
     return mapping.get(label.strip())
 
 
+def get_balance_mode_from_label(label: str) -> Optional[str]:
+    mapping = {
+        "Ручной контроль": "manual",
+        "Фиксированное списание": "fixed",
+        "Средний расход в день": "daily_avg",
+    }
+    return mapping.get(label.strip())
+
+
 def current_month_bounds() -> tuple[datetime, datetime]:
     now = now_local()
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -300,16 +329,146 @@ def format_currency_totals(totals: Dict[str, float]) -> str:
     return " / ".join(parts)
 
 
+def effective_balance(subscription: Subscription, on_date: Optional[date] = None) -> Optional[float]:
+    if subscription.kind != "balance":
+        return None
+    if subscription.current_balance is None:
+        return None
+    if subscription.spending_mode in (None, "manual"):
+        return subscription.current_balance
+
+    start_date = subscription.balance_updated_at or today_local()
+    target_date = on_date or today_local()
+    days_elapsed = max(0, (target_date - start_date).days)
+
+    if subscription.spending_mode == "daily_avg":
+        spend = subscription.spend_amount or 0.0
+        return subscription.current_balance - spend * days_elapsed
+
+    if subscription.spending_mode == "fixed":
+        spend = subscription.spend_amount or 0.0
+        period_days = subscription.spend_period_days or 0
+        if spend <= 0 or period_days <= 0:
+            return subscription.current_balance
+        charges_count = days_elapsed // period_days
+        return subscription.current_balance - spend * charges_count
+
+    return subscription.current_balance
+
+
+def next_fixed_charge_date(subscription: Subscription, on_date: Optional[date] = None) -> Optional[date]:
+    if subscription.kind != "balance" or subscription.spending_mode != "fixed":
+        return None
+    if not subscription.spend_period_days or subscription.spend_period_days <= 0:
+        return None
+    start_date = subscription.balance_updated_at or today_local()
+    target_date = on_date or today_local()
+    days_elapsed = max(0, (target_date - start_date).days)
+    charges_count = days_elapsed // subscription.spend_period_days
+    return start_date + timedelta(days=(charges_count + 1) * subscription.spend_period_days)
+
+
+def days_until_balance_threshold(subscription: Subscription, on_date: Optional[date] = None) -> Optional[int]:
+    if subscription.kind != "balance" or subscription.min_balance is None:
+        return None
+    balance_now = effective_balance(subscription, on_date)
+    if balance_now is None:
+        return None
+    if balance_now <= subscription.min_balance:
+        return 0
+
+    if subscription.spending_mode == "daily_avg":
+        spend = subscription.spend_amount or 0.0
+        if spend <= 0:
+            return None
+        return max(0, math.ceil((balance_now - subscription.min_balance) / spend))
+
+    if subscription.spending_mode == "fixed":
+        spend = subscription.spend_amount or 0.0
+        period_days = subscription.spend_period_days or 0
+        if spend <= 0 or period_days <= 0:
+            return None
+        charges_needed = max(
+            1,
+            math.ceil((balance_now - subscription.min_balance) / spend),
+        )
+        next_charge = next_fixed_charge_date(subscription, on_date)
+        if next_charge is None:
+            return None
+        days_to_next_charge = max(0, (next_charge - (on_date or today_local())).days)
+        return days_to_next_charge + (charges_needed - 1) * period_days
+
+    return None
+
+
+def projected_threshold_date(subscription: Subscription, on_date: Optional[date] = None) -> Optional[date]:
+    days_left = days_until_balance_threshold(subscription, on_date)
+    if days_left is None:
+        return None
+    return (on_date or today_local()) + timedelta(days=days_left)
+
+
+def spending_summary(subscription: Subscription) -> str:
+    if subscription.kind != "balance":
+        return "—"
+    mode = subscription.spending_mode or "manual"
+    if mode == "manual":
+        return "Ручной контроль"
+    if mode == "daily_avg":
+        spend = subscription.spend_amount or 0.0
+        return f"~{format_money(spend, subscription.currency)} в день"
+    if mode == "fixed":
+        spend = subscription.spend_amount or 0.0
+        period_days = subscription.spend_period_days or 0
+        return f"{format_money(spend, subscription.currency)} каждые {period_days} дн."
+    return "—"
+
+
+def balance_projection_lines(subscription: Subscription) -> List[str]:
+    if subscription.kind != "balance":
+        return []
+
+    lines = [f"Модель расхода: {BALANCE_MODE_LABELS.get(subscription.spending_mode or 'manual', 'Ручной контроль')}"]
+
+    if subscription.spending_mode in {"fixed", "daily_avg"}:
+        lines.append(f"Прогнозный расход: {spending_summary(subscription)}")
+
+    if subscription.balance_updated_at is not None:
+        lines.append(f"Точка отсчёта баланса: {subscription.balance_updated_at.strftime('%d.%m.%Y')}")
+
+    days_left = days_until_balance_threshold(subscription)
+    threshold_date = projected_threshold_date(subscription)
+
+    if subscription.spending_mode == "fixed":
+        next_charge = next_fixed_charge_date(subscription)
+        if next_charge is not None:
+            lines.append(f"Следующее прогнозное списание: {next_charge.strftime('%d.%m.%Y')}")
+
+    if threshold_date is not None:
+        if days_left == 0:
+            lines.append("Порог уже достигнут или ниже")
+        else:
+            lines.append(
+                f"До порога примерно: {days_left} дн. ({threshold_date.strftime('%d.%m.%Y')})"
+            )
+
+    return lines
+
+
 def subscription_status(subscription: Subscription) -> str:
     if not subscription.active:
         return "⏸ Пауза"
     if subscription.kind == "balance":
+        current_balance = effective_balance(subscription)
         if (
-            subscription.current_balance is not None
+            current_balance is not None
             and subscription.min_balance is not None
-            and subscription.current_balance <= subscription.min_balance
+            and current_balance <= subscription.min_balance
         ):
             return "🔴 Нужно пополнить"
+        days_left = days_until_balance_threshold(subscription)
+        if days_left is not None and 0 < days_left <= BALANCE_WARNING_DAYS:
+            return f"🟡 До порога ~{days_left} дн."
         return "🟢 Активна"
     if subscription.next_charge_date is None:
         return "🟢 Активна"
@@ -336,9 +495,10 @@ def render_subscription(subscription: Subscription) -> str:
         )
         lines.append(
             "Баланс: "
-            f"{format_optional_money(subscription.current_balance, subscription.currency)}"
+            f"{format_optional_money(effective_balance(subscription), subscription.currency)}"
             f" | Мин. порог: {format_optional_money(subscription.min_balance, subscription.currency)}"
         )
+        lines.extend(balance_projection_lines(subscription))
     else:
         lines.append(
             f"Стоимость: {format_money(subscription.amount, subscription.currency)}"
@@ -375,12 +535,30 @@ def low_balance_subscriptions(store: UserStore) -> List[Subscription]:
     for subscription in balance_subscriptions(store):
         if not subscription.active:
             continue
+        current_balance = effective_balance(subscription)
         if (
-            subscription.current_balance is not None
+            current_balance is not None
             and subscription.min_balance is not None
-            and subscription.current_balance <= subscription.min_balance
+            and current_balance <= subscription.min_balance
         ):
             result.append(subscription)
+    return result
+
+
+def balance_warning_subscriptions(store: UserStore, days: int = BALANCE_WARNING_DAYS) -> List[Subscription]:
+    result = []
+    for subscription in balance_subscriptions(store):
+        if not subscription.active:
+            continue
+        current_balance = effective_balance(subscription)
+        if current_balance is None or subscription.min_balance is None:
+            continue
+        if current_balance <= subscription.min_balance:
+            continue
+        days_left = days_until_balance_threshold(subscription)
+        if days_left is not None and 0 < days_left <= days:
+            result.append(subscription)
+    result.sort(key=lambda item: days_until_balance_threshold(item) or 10**9)
     return result
 
 
@@ -399,7 +577,13 @@ def upcoming_subscriptions(store: UserStore, days: int = SOON_DAYS) -> List[Subs
     return result
 
 
-def record_history(store: UserStore, subscription: Subscription, amount: float, event_type: str, note: str = "") -> None:
+def record_history(
+    store: UserStore,
+    subscription: Subscription,
+    amount: float,
+    event_type: str,
+    note: str = "",
+) -> None:
     store.history.append(
         ExpenseEvent(
             timestamp=now_local(),
@@ -461,7 +645,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Что умею:\n"
         "• хранить подписки и балансовые сервисы\n"
         "• напоминать о ближайших списаниях\n"
-        "• сигналить, когда баланс ниже порога\n"
+        "• прогнозировать падение баланса по модели расхода\n"
+        "• сигналить, когда баланс ниже порога или скоро упрётся в него\n"
         "• фиксировать оплаты и пополнения\n"
         "• показывать сводку, отчёт и историю трат\n\n"
         "Важно: данные хранятся только в памяти процесса. После перезапуска всё сбросится."
@@ -480,7 +665,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/add — добавить подписку\n"
         "/list — показать подписки\n"
         "/soon — ближайшие списания\n"
-        "/topup — сервисы с низким балансом\n"
+        "/topup — сервисы с низким балансом и прогнозом\n"
         "/pay — отметить оплату или пополнение\n"
         "/setbalance — обновить текущий баланс\n"
         "/dashboard — общая сводка\n"
@@ -521,10 +706,29 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount=30,
             currency="USD",
             project="Все проекты",
-            notes="Демо балансового сервиса",
+            notes="Демо балансового сервиса с ежедневным расходом",
             created_at=now_local(),
-            current_balance=7,
+            current_balance=25,
             min_balance=10,
+            balance_updated_at=today,
+            spending_mode="daily_avg",
+            spend_amount=3.5,
+        ),
+        Subscription(
+            id=uuid4().hex[:8],
+            name=f"Интернет #{demo_suffix}",
+            kind="balance",
+            amount=1000,
+            currency="RUB",
+            project="Личное",
+            notes="Демо фиксированного списания",
+            created_at=now_local(),
+            current_balance=850,
+            min_balance=100,
+            balance_updated_at=today,
+            spending_mode="fixed",
+            spend_amount=250,
+            spend_period_days=7,
         ),
         Subscription(
             id=uuid4().hex[:8],
@@ -543,7 +747,7 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         store.subscriptions[subscription.id] = subscription
 
     await update.message.reply_text(
-        "Добавил демо-набор: VPS, OpenAI и домен. Открой /list или /dashboard.",
+        "Добавил демо-набор с месячной подпиской, годовым сервисом и двумя балансовыми моделями.",
         reply_markup=MENU,
     )
 
@@ -551,6 +755,7 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("pending_subscription", None)
     context.user_data.pop("pending_payment_id", None)
+    context.user_data.pop("pending_payment_amount", None)
     context.user_data.pop("pending_balance_id", None)
     await update.message.reply_text("Диалог отменён.", reply_markup=MENU)
     return ConversationHandler.END
@@ -616,7 +821,7 @@ async def add_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await update.message.reply_text(
         "Введи проект или группу, к которой относится сервис.\nНапример: Bot A, Все проекты, Личное",
         reply_markup=ReplyKeyboardMarkup(
-            [["Все проекты", "/cancel"]], resize_keyboard=True, one_time_keyboard=True
+            [["Все проекты", "Личное"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True
         ),
     )
     return ADD_PROJECT
@@ -650,7 +855,7 @@ async def add_next_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["pending_subscription"]["next_charge_date"] = value
     await update.message.reply_text(
         "За сколько дней до списания напоминать?\nНапример: 3",
-        reply_markup=ReplyKeyboardMarkup([["3", "7", "/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        reply_markup=ReplyKeyboardMarkup([["3", "7", "14"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
     )
     return ADD_REMIND_DAYS
 
@@ -673,7 +878,9 @@ async def add_current_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
     if balance is None:
         await update.message.reply_text("Введи корректное число. Например: 12.5")
         return ADD_CURRENT_BALANCE
-    context.user_data["pending_subscription"]["current_balance"] = balance
+    pending = context.user_data["pending_subscription"]
+    pending["current_balance"] = balance
+    pending["balance_updated_at"] = today_local()
     await update.message.reply_text(
         "Введи минимальный порог. Когда баланс станет меньше или равен этому значению, я напомню о пополнении.",
         reply_markup=ReplyKeyboardMarkup([["10", "/cancel"]], resize_keyboard=True, one_time_keyboard=True),
@@ -687,6 +894,76 @@ async def add_min_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Введи корректное число. Например: 10")
         return ADD_MIN_BALANCE
     context.user_data["pending_subscription"]["min_balance"] = minimum
+    await update.message.reply_text(
+        "Выбери тип контроля расхода для баланса:",
+        reply_markup=BALANCE_MODE_KEYBOARD,
+    )
+    return ADD_BALANCE_MODE
+
+
+async def add_balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    mode = get_balance_mode_from_label(update.message.text)
+    if mode is None:
+        await update.message.reply_text(
+            "Выбери один из вариантов кнопкой ниже.",
+            reply_markup=BALANCE_MODE_KEYBOARD,
+        )
+        return ADD_BALANCE_MODE
+
+    pending = context.user_data["pending_subscription"]
+    pending["spending_mode"] = mode
+
+    if mode == "manual":
+        await update.message.reply_text(
+            "Добавь заметку или отправь '-' чтобы пропустить.",
+            reply_markup=YES_SKIP_KEYBOARD,
+        )
+        return ADD_NOTES
+
+    if mode == "fixed":
+        await update.message.reply_text(
+            "Введи сумму одного списания.\nНапример: 250",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        )
+        return ADD_SPEND_AMOUNT
+
+    await update.message.reply_text(
+        "Введи средний расход в день.\nНапример: 20",
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+    )
+    return ADD_SPEND_AMOUNT
+
+
+async def add_spend_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = parse_float(update.message.text)
+    if value is None:
+        await update.message.reply_text("Введи корректную сумму. Например: 20")
+        return ADD_SPEND_AMOUNT
+
+    pending = context.user_data["pending_subscription"]
+    pending["spend_amount"] = value
+
+    if pending.get("spending_mode") == "fixed":
+        await update.message.reply_text(
+            "Введи период списания в днях.\nНапример: 30",
+            reply_markup=ReplyKeyboardMarkup([["7", "30", "/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        )
+        return ADD_SPEND_PERIOD
+
+    pending["spend_period_days"] = 1
+    await update.message.reply_text(
+        "Добавь заметку или отправь '-' чтобы пропустить.",
+        reply_markup=YES_SKIP_KEYBOARD,
+    )
+    return ADD_NOTES
+
+
+async def add_spend_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = parse_int(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("Введи положительное число дней. Например: 30")
+        return ADD_SPEND_PERIOD
+    context.user_data["pending_subscription"]["spend_period_days"] = value
     await update.message.reply_text(
         "Добавь заметку или отправь '-' чтобы пропустить.",
         reply_markup=YES_SKIP_KEYBOARD,
@@ -714,6 +991,10 @@ async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         remind_before_days=pending.get("remind_before_days", 3),
         current_balance=pending.get("current_balance"),
         min_balance=pending.get("min_balance"),
+        balance_updated_at=pending.get("balance_updated_at"),
+        spending_mode=pending.get("spending_mode"),
+        spend_amount=pending.get("spend_amount"),
+        spend_period_days=pending.get("spend_period_days"),
     )
     store.subscriptions[subscription.id] = subscription
 
@@ -798,17 +1079,29 @@ async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     subscriptions.sort(
         key=lambda item: (
-            item.current_balance is None,
-            item.current_balance if item.current_balance is not None else 10**9,
+            effective_balance(item) is None,
+            effective_balance(item) if effective_balance(item) is not None else 10**9,
         )
     )
-    await update.message.reply_text("Балансовые сервисы:", reply_markup=MENU)
+    warning = balance_warning_subscriptions(store, BALANCE_WARNING_DAYS)
+    warning_ids = {sub.id for sub in warning}
+    await update.message.reply_text(
+        f"Балансовые сервисы. Отдельно отмечены те, что дойдут до порога примерно за {BALANCE_WARNING_DAYS} дн. или уже ниже него:",
+        reply_markup=MENU,
+    )
     for subscription in subscriptions:
+        prefix = "⏰ Скоро порог\n" if subscription.id in warning_ids else ""
         await update.message.reply_text(
-            render_subscription(subscription),
+            prefix + render_subscription(subscription),
             parse_mode=ParseMode.HTML,
             reply_markup=build_inline_actions(subscription),
         )
+
+
+EVENT_TYPE_LABELS = {
+    "payment": "оплата",
+    "topup": "пополнение",
+}
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -822,9 +1115,10 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     lines = ["Последние траты:"]
     for event in sorted(store.history, key=lambda item: item.timestamp, reverse=True)[:15]:
+        label = EVENT_TYPE_LABELS.get(event.event_type, event.event_type)
         lines.append(
             f"• {event.timestamp.strftime('%d.%m %H:%M')} — {escape(event.subscription_name)} — "
-            f"{format_money(event.amount, event.currency)} ({event.event_type})"
+            f"{format_money(event.amount, event.currency)} ({label})"
         )
     await update.message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
@@ -843,6 +1137,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     paused_total = total - active_total
     due_soon = len(upcoming_subscriptions(store, 7))
     low_balance = len(low_balance_subscriptions(store))
+    forecast_warning = len(balance_warning_subscriptions(store, BALANCE_WARNING_DAYS))
     month_events = history_for_month(store)
     month_totals = summarize_amounts(month_events)
     top_soon = upcoming_subscriptions(store, 7)[:3]
@@ -854,6 +1149,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"На паузе: {paused_total}",
         f"Скоро списаний (7 дн.): {due_soon}",
         f"Низкий баланс: {low_balance}",
+        f"До порога примерно за {BALANCE_WARNING_DAYS} дн.: {forecast_warning}",
         f"Потрачено в этом месяце: {format_currency_totals(month_totals)}",
     ]
     if top_soon:
@@ -967,7 +1263,7 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if subscription.kind == "balance":
         await update.message.reply_text(
             "Введи новый текущий баланс после пополнения.\n"
-            "Или отправь '-' — тогда я просто прибавлю сумму пополнения к текущему балансу.",
+            "Или отправь '-' — тогда я прибавлю сумму пополнения к текущему прогнозному балансу и возьму сегодняшнюю дату как новую точку отсчёта.",
             reply_markup=YES_SKIP_KEYBOARD,
         )
         return PAY_BALANCE
@@ -997,7 +1293,7 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     raw = update.message.text.strip()
     if raw == "-":
-        current = subscription.current_balance or 0.0
+        current = effective_balance(subscription) or 0.0
         subscription.current_balance = current + amount
     else:
         new_balance = parse_float(raw)
@@ -1006,6 +1302,7 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             return PAY_BALANCE
         subscription.current_balance = new_balance
 
+    subscription.balance_updated_at = today_local()
     record_history(store, subscription, amount, "topup")
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
@@ -1047,7 +1344,7 @@ async def set_balance_from_callback(update: Update, context: ContextTypes.DEFAUL
     subscription_id = query.data.split(":", maxsplit=1)[1]
     context.user_data["pending_balance_id"] = subscription_id
     await query.message.reply_text(
-        "Введи новый текущий баланс.",
+        "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.",
         reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
     )
     return BALANCE_VALUE
@@ -1060,7 +1357,7 @@ async def set_balance_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return BALANCE_SELECT
     context.user_data["pending_balance_id"] = match.group(1)
     await update.message.reply_text(
-        "Введи новый текущий баланс.",
+        "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.",
         reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
     )
     return BALANCE_VALUE
@@ -1082,6 +1379,7 @@ async def set_balance_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     subscription.current_balance = value
+    subscription.balance_updated_at = today_local()
     context.user_data.pop("pending_balance_id", None)
     await update.message.reply_text(
         "Баланс обновлён.\n\n" + render_subscription(subscription),
@@ -1155,24 +1453,40 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not subscription.active:
                 continue
             if subscription.kind == "balance":
-                if (
-                    subscription.current_balance is None
-                    or subscription.min_balance is None
-                    or subscription.current_balance > subscription.min_balance
-                ):
+                current_balance = effective_balance(subscription)
+                if current_balance is None or subscription.min_balance is None:
                     continue
-                key = build_alert_key("low", subscription.id)
-                if store.sent_alerts.get(key) == today_local():
+
+                if current_balance <= subscription.min_balance:
+                    key = build_alert_key("low", subscription.id)
+                    if store.sent_alerts.get(key) == today_local():
+                        continue
+                    store.sent_alerts[key] = today_local()
+                    await context.bot.send_message(
+                        chat_id=store.chat_id,
+                        text=(
+                            "🪫 Баланс ниже порога\n\n" + render_subscription(subscription)
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=build_inline_actions(subscription),
+                    )
                     continue
-                store.sent_alerts[key] = today_local()
-                await context.bot.send_message(
-                    chat_id=store.chat_id,
-                    text=(
-                        "🪫 Низкий баланс\n\n" + render_subscription(subscription)
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=build_inline_actions(subscription),
-                )
+
+                days_left = days_until_balance_threshold(subscription)
+                if days_left is not None and 0 < days_left <= BALANCE_WARNING_DAYS:
+                    key = build_alert_key("balance_warn", subscription.id)
+                    if store.sent_alerts.get(key) == today_local():
+                        continue
+                    store.sent_alerts[key] = today_local()
+                    await context.bot.send_message(
+                        chat_id=store.chat_id,
+                        text=(
+                            f"⏰ Баланс дойдёт до порога примерно через {days_left} дн.\n\n"
+                            + render_subscription(subscription)
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=build_inline_actions(subscription),
+                    )
                 continue
 
             if subscription.next_charge_date is None:
@@ -1207,12 +1521,14 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         due_soon = len(upcoming_subscriptions(store, 7))
         low_balance = len(low_balance_subscriptions(store))
+        forecast_warning = len(balance_warning_subscriptions(store, BALANCE_WARNING_DAYS))
         month_totals = summarize_amounts(history_for_month(store))
         lines = [
             "<b>Ежедневная сводка</b>",
             f"Подписок всего: {total}",
             f"Скоро списаний (7 дн.): {due_soon}",
             f"Низкий баланс: {low_balance}",
+            f"До порога примерно за {BALANCE_WARNING_DAYS} дн.: {forecast_warning}",
             f"Потрачено в этом месяце: {format_currency_totals(month_totals)}",
         ]
         await context.bot.send_message(
@@ -1246,6 +1562,9 @@ def add_handlers(application: Application) -> None:
             ADD_REMIND_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_remind_days)],
             ADD_CURRENT_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_current_balance)],
             ADD_MIN_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_min_balance)],
+            ADD_BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_balance_mode)],
+            ADD_SPEND_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_spend_amount)],
+            ADD_SPEND_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_spend_period)],
             ADD_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_notes)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
