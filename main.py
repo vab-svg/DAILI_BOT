@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import math
@@ -7,6 +8,7 @@ from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from html import escape
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -16,6 +18,7 @@ from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -52,6 +55,7 @@ MONTHLY_SUMMARY_TIME = os.getenv("MONTHLY_SUMMARY_TIME", "09:20").strip() or "09
 MONTHLY_SUMMARY_DAY = int(os.getenv("MONTHLY_SUMMARY_DAY", "1"))
 SOON_DAYS = int(os.getenv("SOON_DAYS", "14"))
 BALANCE_WARNING_DAYS = int(os.getenv("BALANCE_WARNING_DAYS", "3"))
+FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "30"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.getenv("DATA_FILE", os.path.join(BASE_DIR, "subscription_data.json")).strip() or os.path.join(BASE_DIR, "subscription_data.json")
 DEFAULT_REMINDER_OFFSETS = [7, 3, 1, 0]
@@ -61,10 +65,12 @@ TZ = ZoneInfo(TIMEZONE_NAME)
 MENU = ReplyKeyboardMarkup(
     [
         ["➕ Добавить", "📋 Подписки"],
-        ["⏰ Скоро списания", "🪫 Низкий баланс"],
-        ["💸 Отметить оплату", "💼 Сводка"],
+        ["📅 Сегодня", "⏰ Скоро списания"],
+        ["🪫 Низкий баланс", "💸 Отметить оплату"],
+        ["💼 Сводка", "🔮 Прогноз"],
         ["📈 Отчёт", "🧾 История"],
-        ["🗃 Архив", "⚙️ Помощь"],
+        ["🗃 Архив", "📤 Экспорт"],
+        ["⚙️ Помощь"],
     ],
     resize_keyboard=True,
 )
@@ -843,6 +849,411 @@ def format_currency_totals(totals: Dict[str, float]) -> str:
     return " / ".join(parts)
 
 
+def sum_forecast_items(items: List[dict]) -> Dict[str, float]:
+    totals: Dict[str, float] = {}
+    for item in items:
+        currency = str(item.get("currency", "USD"))
+        amount = float(item.get("amount", 0.0))
+        totals[currency] = totals.get(currency, 0.0) + amount
+    return totals
+
+
+def summarize_forecast_by_project(items: List[dict]) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, Dict[str, float]] = {}
+    for item in items:
+        project = str(item.get("project", "Личное"))
+        currency = str(item.get("currency", "USD"))
+        amount = float(item.get("amount", 0.0))
+        grouped.setdefault(project, {})
+        grouped[project][currency] = grouped[project].get(currency, 0.0) + amount
+    return grouped
+
+
+def recurring_next_date(subscription: Subscription, source: date) -> date:
+    if subscription.kind == "monthly":
+        return add_months(source, 1)
+    return add_years(source, 1)
+
+
+def forecast_regular_charge_items(subscription: Subscription, window_days: int = FORECAST_DAYS) -> List[dict]:
+    if not subscription.active or subscription.kind not in {"monthly", "yearly"}:
+        return []
+    if subscription.next_charge_date is None:
+        return []
+
+    start_date = today_local()
+    end_date = start_date + timedelta(days=window_days)
+    items: List[dict] = []
+    due_date = subscription.next_charge_date
+    loops = 0
+    while due_date is not None and due_date <= end_date and loops < 24:
+        effective_due = start_date if due_date < start_date else due_date
+        items.append({
+            "type": "charge",
+            "subscription_id": subscription.id,
+            "name": subscription.name,
+            "project": subscription.project,
+            "category": subscription.category,
+            "currency": subscription.currency,
+            "amount": subscription.amount,
+            "due_date": effective_due,
+            "note": "Обязательное списание",
+        })
+        due_date = recurring_next_date(subscription, due_date)
+        loops += 1
+    return items
+
+
+def forecast_balance_topup_items(subscription: Subscription, window_days: int = FORECAST_DAYS) -> List[dict]:
+    if not subscription.active or subscription.kind != "balance":
+        return []
+    if subscription.current_balance is None or subscription.min_balance is None:
+        return []
+
+    topup_amount = subscription.amount or 0.0
+    if topup_amount <= 0:
+        return []
+
+    start_date = today_local()
+    end_date = start_date + timedelta(days=window_days)
+    balance = effective_balance(subscription, start_date)
+    if balance is None:
+        return []
+
+    threshold = subscription.min_balance
+    items: List[dict] = []
+
+    def add_item(due_date: date, note: str) -> None:
+        items.append({
+            "type": "topup",
+            "subscription_id": subscription.id,
+            "name": subscription.name,
+            "project": subscription.project,
+            "category": subscription.category,
+            "currency": subscription.currency,
+            "amount": topup_amount,
+            "due_date": due_date,
+            "note": note,
+        })
+
+    if balance <= threshold:
+        add_item(start_date, "Вероятное пополнение: баланс уже ниже порога")
+        balance += topup_amount
+
+    mode = subscription.spending_mode or "manual"
+    if mode == "manual":
+        return items
+
+    if mode == "daily_avg":
+        spend = subscription.spend_amount or 0.0
+        if spend <= 0:
+            return items
+        for day_offset in range(1, window_days + 1):
+            due_date = start_date + timedelta(days=day_offset)
+            balance -= spend
+            if balance <= threshold:
+                add_item(due_date, "Вероятное пополнение по среднему дневному расходу")
+                balance += topup_amount
+        return items
+
+    if mode == "fixed":
+        spend = subscription.spend_amount or 0.0
+        period_days = subscription.spend_period_days or 0
+        if spend <= 0 or period_days <= 0:
+            return items
+        due_date = next_fixed_charge_date(subscription, start_date)
+        loops = 0
+        while due_date is not None and due_date <= end_date and loops < 365:
+            balance -= spend
+            if balance <= threshold:
+                add_item(due_date, "Вероятное пополнение после фиксированного списания")
+                balance += topup_amount
+            due_date = due_date + timedelta(days=period_days)
+            loops += 1
+    return items
+
+
+def build_forecast_payload(store: UserStore, window_days: int = FORECAST_DAYS) -> dict:
+    regular_items: List[dict] = []
+    topup_items: List[dict] = []
+    unmodelled_balance = 0
+
+    for subscription in store.subscriptions.values():
+        if not subscription.active:
+            continue
+        if subscription.kind in {"monthly", "yearly"}:
+            regular_items.extend(forecast_regular_charge_items(subscription, window_days))
+        elif subscription.kind == "balance":
+            current_balance = effective_balance(subscription)
+            if subscription.spending_mode in {None, "manual"} and (
+                subscription.current_balance is None
+                or subscription.min_balance is None
+                or current_balance is None
+                or current_balance > (subscription.min_balance or 0)
+            ):
+                unmodelled_balance += 1
+            topup_items.extend(forecast_balance_topup_items(subscription, window_days))
+
+    all_items = sorted(regular_items + topup_items, key=lambda item: (item["due_date"], item["name"].lower(), item["type"]))
+    regular_totals = sum_forecast_items(regular_items)
+    topup_totals = sum_forecast_items(topup_items)
+    total_totals = sum_forecast_items(all_items)
+    return {
+        "window_days": window_days,
+        "regular_items": regular_items,
+        "topup_items": topup_items,
+        "all_items": all_items,
+        "regular_totals": regular_totals,
+        "topup_totals": topup_totals,
+        "total_totals": total_totals,
+        "by_project": summarize_forecast_by_project(all_items),
+        "unmodelled_balance": unmodelled_balance,
+    }
+
+
+def build_forecast_lines(store: UserStore, title: str = "Прогноз расходов", window_days: int = FORECAST_DAYS) -> List[str]:
+    payload = build_forecast_payload(store, window_days)
+    lines = [
+        f"<b>{title}</b>",
+        f"Период: {window_days} дн.",
+        f"Обязательные списания: {format_currency_totals(payload['regular_totals'])}",
+        f"Вероятные пополнения: {format_currency_totals(payload['topup_totals'])}",
+        f"Общий прогноз: {format_currency_totals(payload['total_totals'])}",
+        f"Событий: {len(payload['all_items'])}",
+    ]
+    if payload['unmodelled_balance']:
+        lines.append(f"Без прогноза по части балансовых сервисов: {payload['unmodelled_balance']}")
+
+    by_project = payload['by_project']
+    if by_project:
+        lines.append("\n<b>По проектам</b>")
+        for project, amounts in sorted(by_project.items()):
+            lines.append(f"• {escape(project)} — {format_currency_totals(amounts)}")
+
+    if payload['all_items']:
+        lines.append("\n<b>Ближайшие события</b>")
+        for item in payload['all_items'][:10]:
+            icon = "💳" if item['type'] == 'charge' else "🪫"
+            lines.append(
+                f"• {icon} {item['due_date'].strftime('%d.%m.%Y')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
+            )
+
+    return lines
+
+
+def build_today_lines(store: UserStore) -> List[str]:
+    today = today_local()
+    overdue = [
+        item for item in store.subscriptions.values()
+        if item.active and item.kind != 'balance' and item.next_charge_date is not None and item.next_charge_date < today
+    ]
+    due_today = [
+        item for item in store.subscriptions.values()
+        if item.active and item.kind != 'balance' and item.next_charge_date == today
+    ]
+    low_now = low_balance_subscriptions(store)
+    threshold_today = [
+        item for item in balance_warning_subscriptions(store, 1)
+        if item not in low_now
+    ]
+
+    lines = [
+        "<b>Сегодня</b>",
+        f"Просрочено: {len(overdue)}",
+        f"Списаний сегодня: {len(due_today)}",
+        f"Нужно пополнить сейчас: {len(low_now)}",
+        f"Порог в течение 1 дня: {len(threshold_today)}",
+    ]
+
+    if overdue:
+        lines.append("\n<b>Просроченные подписки</b>")
+        for subscription in sorted(overdue, key=lambda item: item.next_charge_date or today)[:5]:
+            delta = (today - (subscription.next_charge_date or today)).days
+            lines.append(f"• {escape(subscription.name)} — просрочено на {delta} дн.")
+
+    if due_today:
+        lines.append("\n<b>Нужно оплатить сегодня</b>")
+        for subscription in sorted(due_today, key=lambda item: item.name.lower())[:5]:
+            lines.append(f"• {escape(subscription.name)} — {format_money(subscription.amount, subscription.currency)}")
+
+    if low_now:
+        lines.append("\n<b>Нужно пополнить</b>")
+        for subscription in low_now[:5]:
+            lines.append(f"• {escape(subscription.name)} — {format_optional_money(effective_balance(subscription), subscription.currency)}")
+
+    if threshold_today:
+        lines.append("\n<b>Скоро упрётся в порог</b>")
+        for subscription in threshold_today[:5]:
+            days_left = days_until_balance_threshold(subscription)
+            lines.append(f"• {escape(subscription.name)} — примерно {days_left} дн.")
+
+    if len(lines) == 5:
+        lines.append("\nНа сегодня срочных действий нет.")
+    return lines
+
+
+def parse_boolish(value: str, default: bool = False) -> bool:
+    cleaned = str(value).strip().casefold()
+    if cleaned in {"1", "true", "yes", "y", "да"}:
+        return True
+    if cleaned in {"0", "false", "no", "n", "нет"}:
+        return False
+    return default
+
+
+def export_user_payload(user_id: int) -> dict:
+    store = RUNTIME_USERS.get(user_id, UserStore(user_id=user_id))
+    activity = USER_ACTIVITY_LOG.get(user_id, UserActivity(user_id=user_id))
+    return {
+        "format": "subscription-bot-user-v1",
+        "exported_at": datetime_to_iso(now_local()),
+        "user_store": user_store_to_dict(store),
+        "user_activity": user_activity_to_dict(activity),
+    }
+
+
+def subscriptions_csv_text(store: UserStore) -> str:
+    output = StringIO()
+    fieldnames = [
+        "source", "id", "name", "kind", "amount", "currency", "project", "category", "tags", "notes",
+        "active", "next_charge_date", "remind_before_days", "reminder_offsets", "repeat_daily_until_paid",
+        "current_balance", "min_balance", "balance_updated_at", "spending_mode", "spend_amount",
+        "spend_period_days", "snoozed_until",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for source_name, pool in (("active", store.subscriptions), ("archived", store.archived_subscriptions)):
+        for subscription in sorted(pool.values(), key=lambda item: item.name.lower()):
+            writer.writerow({
+                "source": source_name,
+                "id": subscription.id,
+                "name": subscription.name,
+                "kind": subscription.kind,
+                "amount": subscription.amount,
+                "currency": subscription.currency,
+                "project": subscription.project,
+                "category": subscription.category,
+                "tags": ", ".join(subscription.tags),
+                "notes": subscription.notes,
+                "active": int(subscription.active),
+                "next_charge_date": date_to_iso(subscription.next_charge_date) or "",
+                "remind_before_days": subscription.remind_before_days,
+                "reminder_offsets": format_reminder_offsets(current_reminder_offsets(subscription)),
+                "repeat_daily_until_paid": int(subscription.repeat_daily_until_paid),
+                "current_balance": "" if subscription.current_balance is None else subscription.current_balance,
+                "min_balance": "" if subscription.min_balance is None else subscription.min_balance,
+                "balance_updated_at": date_to_iso(subscription.balance_updated_at) or "",
+                "spending_mode": subscription.spending_mode or "",
+                "spend_amount": "" if subscription.spend_amount is None else subscription.spend_amount,
+                "spend_period_days": "" if subscription.spend_period_days is None else subscription.spend_period_days,
+                "snoozed_until": date_to_iso(subscription.snoozed_until) or "",
+            })
+    return output.getvalue()
+
+
+def history_csv_text(store: UserStore) -> str:
+    output = StringIO()
+    fieldnames = ["timestamp", "subscription_id", "subscription_name", "amount", "currency", "project", "category", "event_type", "note"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for event in sorted(store.history, key=lambda item: item.timestamp):
+        writer.writerow(expense_event_to_dict(event))
+    return output.getvalue()
+
+
+def subscription_from_csv_row(row: dict) -> Subscription:
+    raw_id = (row.get("id") or "").strip() or uuid4().hex[:8]
+    tags = [item.strip() for item in str(row.get("tags", "")).split(",") if item.strip()]
+    reminder_offsets = parse_reminder_offsets(str(row.get("reminder_offsets", "")))
+    kind = (row.get("kind") or "monthly").strip()
+    if kind not in KIND_LABELS:
+        labels_map = {value.casefold(): key for key, value in KIND_LABELS.items()}
+        kind = labels_map.get(kind.casefold(), "monthly")
+    subscription = Subscription(
+        id=raw_id,
+        name=(row.get("name") or "Без названия").strip(),
+        kind=kind,
+        amount=float(row.get("amount") or 0.0),
+        currency=(parse_currency_input(str(row.get("currency", "USD"))) or "USD"),
+        project=(row.get("project") or "Личное").strip() or "Личное",
+        category=(row.get("category") or "Прочее").strip() or "Прочее",
+        tags=tags,
+        notes=(row.get("notes") or "").strip(),
+        created_at=now_local(),
+        active=parse_boolish(str(row.get("active", "1")), True),
+        next_charge_date=parse_iso_date((row.get("next_charge_date") or "").strip()),
+        remind_before_days=int(row.get("remind_before_days") or 3),
+        current_balance=(None if str(row.get("current_balance", "")).strip() == "" else float(row.get("current_balance"))),
+        min_balance=(None if str(row.get("min_balance", "")).strip() == "" else float(row.get("min_balance"))),
+        balance_updated_at=parse_iso_date((row.get("balance_updated_at") or "").strip()),
+        spending_mode=((row.get("spending_mode") or "").strip() or None),
+        spend_amount=(None if str(row.get("spend_amount", "")).strip() == "" else float(row.get("spend_amount"))),
+        spend_period_days=(None if str(row.get("spend_period_days", "")).strip() == "" else int(float(row.get("spend_period_days")))),
+        reminder_offsets=normalize_reminder_offsets(reminder_offsets or [int(row.get("remind_before_days") or 3), 0]),
+        repeat_daily_until_paid=parse_boolish(str(row.get("repeat_daily_until_paid", "1")), True),
+        snoozed_until=parse_iso_date((row.get("snoozed_until") or "").strip()),
+    )
+    return subscription
+
+
+def apply_import_payload(target_user_id: int, payload: dict, chat_id: Optional[int]) -> tuple[int, int, int]:
+    store_data = payload.get("user_store")
+    activity_data = payload.get("user_activity")
+
+    if store_data is None and "users" in payload:
+        users_payload = payload.get("users") or {}
+        key = str(target_user_id)
+        if key in users_payload:
+            store_data = users_payload[key]
+        elif len(users_payload) == 1:
+            store_data = next(iter(users_payload.values()))
+        else:
+            raise ValueError("Не удалось выбрать пользователя из JSON-дампа")
+        activities_payload = payload.get("activity") or {}
+        if key in activities_payload:
+            activity_data = activities_payload[key]
+        elif len(activities_payload) == 1:
+            activity_data = next(iter(activities_payload.values()))
+
+    if store_data is None:
+        raise ValueError("В JSON нет блока user_store")
+
+    imported_store = user_store_from_dict(store_data)
+    imported_store.user_id = target_user_id
+    imported_store.chat_id = chat_id
+    RUNTIME_USERS[target_user_id] = imported_store
+
+    if activity_data is not None:
+        imported_activity = user_activity_from_dict(activity_data)
+        imported_activity.user_id = target_user_id
+        imported_activity.chat_id = chat_id
+        imported_activity.last_seen_at = now_local()
+        USER_ACTIVITY_LOG[target_user_id] = imported_activity
+
+    save_state()
+    return len(imported_store.subscriptions), len(imported_store.archived_subscriptions), len(imported_store.history)
+
+
+def apply_import_csv(target_user_id: int, csv_text: str, chat_id: Optional[int]) -> tuple[int, int]:
+    reader = csv.DictReader(StringIO(csv_text))
+    store = get_store(target_user_id, chat_id)
+    imported_active = 0
+    imported_archived = 0
+    for row in reader:
+        if not row:
+            continue
+        subscription = subscription_from_csv_row(row)
+        source = str(row.get("source", "active")).strip().casefold()
+        if source == "archived":
+            store.archived_subscriptions[subscription.id] = subscription
+            imported_archived += 1
+        else:
+            store.subscriptions[subscription.id] = subscription
+            imported_active += 1
+    save_state()
+    return imported_active, imported_archived
+
+
 def effective_balance(subscription: Subscription, on_date: Optional[date] = None) -> Optional[float]:
     if subscription.kind != "balance":
         return None
@@ -1218,13 +1629,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
         "Привет. Я помогу держать под контролем все платные сервисы и подписки.\n\n"
         "Что умею:\n"
-        "• хранить подписки и балансовые сервисы\n"
-        "• напоминать о ближайших списаниях\n"
-        "• прогнозировать падение баланса по модели расхода\n"
-        "• сигналить, когда баланс ниже порога или скоро упрётся в него\n"
-        "• фиксировать оплаты и пополнения\n"
-        "• показывать сводку, отчёт и историю трат\n"
-        "• редактировать подписки и смотреть историю по каждой подписке\n\n"
+        "• хранить подписки, балансовые сервисы, категории и теги\n"
+        "• напоминать о ближайших списаниях и низком балансе\n"
+        "• показывать, что нужно сделать сегодня\n"
+        f"• строить прогноз расходов на {FORECAST_DAYS} дней\n"
+        "• фиксировать оплаты, пополнения и хранить историю\n"
+        "• делать экспорт и импорт бэкапа\n"
+        "• показывать сводку, отчёты и архив подписок\n\n"
         f"Данные сохраняются локально в JSON: {escape(DATA_FILE)}"
     )
     if not store.subscriptions:
@@ -1240,12 +1651,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — главное меню\n"
         "/add — добавить подписку\n"
         "/list — показать подписки\n"
+        "/today — что требует внимания сегодня\n"
         "/soon — ближайшие списания\n"
         "/topup — сервисы с низким балансом и прогнозом\n"
         "/pay — отметить оплату или пополнение\n"
         "/setbalance — обновить текущий баланс\n"
         "/edit — изменить подписку\n"
-        "/dashboard — общая сводка\n"
+        "/dashboard — расширенная сводка\n"
+        "/forecast — прогноз расходов на ближайший период\n"
         "/report — отчёт за текущий месяц\n"
         "/weekly — сводка за 7 дней\n"
         "/monthly — сводка за месяц\n"
@@ -1253,6 +1666,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/find текст — поиск по названию, проекту, категории, тегам\n"
         "/filter критерии — фильтр, например currency:RUB category:AI tag:личное\n"
         "/history — история последних трат\n"
+        "/export [json|csv] — выгрузить резервную копию\n"
+        "/import — загрузить JSON или CSV экспорт обратно в бота\n"
         "/users — кто пользуется ботом\n"
         "/demo — добавить демо-набор подписок\n"
         "/cancel — отменить текущий диалог"
@@ -1845,11 +2260,11 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     active_total = len(active_subscriptions(store))
     paused_total = total - active_total
     archived_total = archive_count(store)
-    due_soon = len(upcoming_subscriptions(store, 7))
-    low_balance = len(low_balance_subscriptions(store))
-    forecast_warning = len(balance_warning_subscriptions(store, BALANCE_WARNING_DAYS))
+    today_lines = build_today_lines(store)
+    forecast = build_forecast_payload(store, FORECAST_DAYS)
     month_events = history_for_month(store)
     month_totals = summarize_amounts(month_events)
+    categories = summarize_subscription_inventory_by_category(active_subscriptions(store))
     top_soon = upcoming_subscriptions(store, 7)[:3]
 
     lines = [
@@ -1858,16 +2273,20 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Активных: {active_total}",
         f"На паузе: {paused_total}",
         f"В архиве: {archived_total}",
-        f"Скоро списаний (7 дн.): {due_soon}",
-        f"Низкий баланс: {low_balance}",
-        f"До порога примерно за {BALANCE_WARNING_DAYS} дн.: {forecast_warning}",
         f"Потрачено в этом месяце: {format_currency_totals(month_totals)}",
+        f"Прогноз на {FORECAST_DAYS} дн.: {format_currency_totals(forecast['total_totals'])}",
+        f"Из них обязательные списания: {format_currency_totals(forecast['regular_totals'])}",
+        f"Вероятные пополнения: {format_currency_totals(forecast['topup_totals'])}",
     ]
-    categories = summarize_subscription_inventory_by_category(active_subscriptions(store))
+
+    lines.append("\n<b>Что требует внимания сегодня</b>")
+    lines.extend(today_lines[1:5])
+
     if categories:
         lines.append("\n<b>Категории</b>")
         for category, count in sorted(categories.items(), key=lambda item: (-item[1], item[0].lower()))[:5]:
             lines.append(f"• {escape(category)} — {count}")
+
     if top_soon:
         lines.append("\n<b>Ближайшие оплаты</b>")
         for subscription in top_soon:
@@ -1877,6 +2296,15 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             lines.append(
                 f"• {escape(subscription.name)} — {subscription.next_charge_date.strftime('%d.%m.%Y')} ({delta} дн.)"
             )
+
+    if forecast['all_items']:
+        lines.append("\n<b>Прогнозируемые события</b>")
+        for item in forecast['all_items'][:5]:
+            icon = '💳' if item['type'] == 'charge' else '🪫'
+            lines.append(
+                f"• {icon} {item['due_date'].strftime('%d.%m.%Y')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
+            )
+
     await update.message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
     )
@@ -1956,6 +2384,111 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     start, end = current_month_bounds()
     lines = build_period_summary_lines(store, 'Сводка за месяц', start, end)
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    lines = build_forecast_lines(store, f'Прогноз расходов на {FORECAST_DAYS} дн.', FORECAST_DAYS)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    lines = build_today_lines(store)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    mode = (context.args[0].strip().lower() if context.args else 'json')
+    stamp = now_local().strftime('%Y%m%d_%H%M')
+
+    if mode == 'csv':
+        subscriptions_bytes = subscriptions_csv_text(store).encode('utf-8')
+        history_bytes = history_csv_text(store).encode('utf-8')
+        await update.message.reply_document(
+            document=InputFile(BytesIO(subscriptions_bytes), filename=f'subscriptions_{stamp}.csv'),
+            caption='Экспорт подписок в CSV.',
+        )
+        await update.message.reply_document(
+            document=InputFile(BytesIO(history_bytes), filename=f'history_{stamp}.csv'),
+            caption='Экспорт истории в CSV.',
+            reply_markup=MENU,
+        )
+        return
+
+    payload = export_user_payload(user.id)
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    await update.message.reply_document(
+        document=InputFile(BytesIO(raw), filename=f'subscription_backup_{stamp}.json'),
+        caption='JSON-бэкап готов. Для CSV используй /export csv.',
+        reply_markup=MENU,
+    )
+
+
+async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    context.user_data['awaiting_import'] = True
+    await update.message.reply_text(
+        'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
+        reply_markup=MENU,
+    )
+
+
+async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    if not context.user_data.get('awaiting_import'):
+        return
+    message = update.effective_message
+    document = message.document if message else None
+    if document is None:
+        return
+
+    tg_file = await document.get_file()
+    buffer = BytesIO()
+    await tg_file.download_to_memory(out=buffer)
+    raw = buffer.getvalue()
+    filename = (document.file_name or '').lower()
+
+    user = update.effective_user
+    chat = update.effective_chat
+    try:
+        if filename.endswith('.json'):
+            payload = json.loads(raw.decode('utf-8'))
+            active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
+            await message.reply_text(
+                f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
+                reply_markup=MENU,
+            )
+        elif filename.endswith('.csv'):
+            imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
+            await message.reply_text(
+                f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
+                reply_markup=MENU,
+            )
+        else:
+            await message.reply_text('Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
+            return
+    except Exception as exc:
+        LOGGER.exception('Import failed: %s', exc)
+        await message.reply_text(f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
+        return
+    finally:
+        context.user_data['awaiting_import'] = False
 
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2521,12 +3054,15 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     routes = {
         "📋 Подписки": list_command,
+        "📅 Сегодня": today_command,
         "⏰ Скоро списания": soon_command,
         "🪫 Низкий баланс": topup_command,
         "💼 Сводка": dashboard_command,
+        "🔮 Прогноз": forecast_command,
         "📈 Отчёт": report_command,
         "🧾 История": history_command,
         "🗃 Архив": archive_command,
+        "📤 Экспорт": export_command,
         "⚙️ Помощь": help_command,
     }
     handler = routes.get(text)
@@ -2754,15 +3290,25 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("demo", demo_command))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("soon", soon_command))
     application.add_handler(CommandHandler("topup", topup_command))
     application.add_handler(CommandHandler("dashboard", dashboard_command))
+    application.add_handler(CommandHandler("forecast", forecast_command))
     application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("weekly", weekly_command))
+    application.add_handler(CommandHandler("monthly", monthly_command))
+    application.add_handler(CommandHandler("archive", archive_command))
+    application.add_handler(CommandHandler("find", find_command))
+    application.add_handler(CommandHandler("filter", filter_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("export", export_command))
+    application.add_handler(CommandHandler("import", import_command))
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
     application.add_handler(balance_conversation)
     application.add_handler(edit_conversation)
+    application.add_handler(MessageHandler(filters.Document.ALL, import_document_handler))
     application.add_handler(CallbackQueryHandler(show_subscription_history_callback, pattern=r"^historysub:"))
     application.add_handler(
         CallbackQueryHandler(subscription_action_callback, pattern=r"^(pause|resume|delete|snooze|restore|purge):")
