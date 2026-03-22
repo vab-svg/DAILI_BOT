@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -6,6 +7,7 @@ from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from html import escape
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -46,6 +48,9 @@ DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "09:00").strip() or "09:00"
 ALERTS_TIME = os.getenv("ALERTS_TIME", "08:30").strip() or "08:30"
 SOON_DAYS = int(os.getenv("SOON_DAYS", "14"))
 BALANCE_WARNING_DAYS = int(os.getenv("BALANCE_WARNING_DAYS", "3"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.getenv("DATA_FILE", os.path.join(BASE_DIR, "subscription_data.json")).strip() or os.path.join(BASE_DIR, "subscription_data.json")
+DEFAULT_REMINDER_OFFSETS = [7, 3, 1, 0]
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
@@ -86,6 +91,10 @@ BALANCE_MODE_KEYBOARD = ReplyKeyboardMarkup(
 
 YES_SKIP_KEYBOARD = ReplyKeyboardMarkup(
     [["-", "/cancel"]], resize_keyboard=True, one_time_keyboard=True
+)
+
+YES_NO_KEYBOARD = ReplyKeyboardMarkup(
+    [["Да", "Нет"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True
 )
 
 CURRENCY_ALIASES = {
@@ -130,6 +139,7 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     ADD_PROJECT,
     ADD_NEXT_DATE,
     ADD_REMIND_DAYS,
+    ADD_REPEAT_UNTIL_PAID,
     ADD_CURRENT_BALANCE,
     ADD_MIN_BALANCE,
     ADD_BALANCE_MODE,
@@ -141,7 +151,10 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
     PAY_BALANCE,
     BALANCE_SELECT,
     BALANCE_VALUE,
-) = range(18)
+    EDIT_SELECT,
+    EDIT_FIELD,
+    EDIT_VALUE,
+) = range(22)
 
 
 @dataclass
@@ -163,6 +176,9 @@ class Subscription:
     spending_mode: Optional[str] = None
     spend_amount: Optional[float] = None
     spend_period_days: Optional[int] = None
+    reminder_offsets: List[int] = field(default_factory=lambda: DEFAULT_REMINDER_OFFSETS.copy())
+    repeat_daily_until_paid: bool = True
+    snoozed_until: Optional[date] = None
 
 
 @dataclass
@@ -203,6 +219,256 @@ class UserActivity:
 
 RUNTIME_USERS: Dict[int, UserStore] = {}
 USER_ACTIVITY_LOG: Dict[int, UserActivity] = {}
+
+
+def normalize_reminder_offsets(offsets: Optional[List[int]]) -> List[int]:
+    if not offsets:
+        return DEFAULT_REMINDER_OFFSETS.copy()
+    cleaned = sorted({int(value) for value in offsets if int(value) >= 0}, reverse=True)
+    return cleaned or DEFAULT_REMINDER_OFFSETS.copy()
+
+
+def format_reminder_offsets(offsets: Optional[List[int]]) -> str:
+    items = normalize_reminder_offsets(offsets)
+    return ", ".join(str(item) for item in items)
+
+
+def parse_reminder_offsets(text: str) -> Optional[List[int]]:
+    raw = text.strip().replace(" ", "")
+    parts = [part for part in raw.split(",") if part != ""]
+    if not parts:
+        return None
+    values: List[int] = []
+    for part in parts:
+        if not part.isdigit():
+            return None
+        values.append(int(part))
+    return normalize_reminder_offsets(values)
+
+
+def parse_yes_no(text: str) -> Optional[bool]:
+    value = text.strip().lower()
+    if value in {"да", "yes", "y", "1"}:
+        return True
+    if value in {"нет", "no", "n", "0"}:
+        return False
+    return None
+
+
+def parse_balance_mode_input(text: str) -> Optional[str]:
+    direct = get_balance_mode_from_label(text)
+    if direct is not None:
+        return direct
+    mapping = {
+        "manual": "manual",
+        "fixed": "fixed",
+        "daily_avg": "daily_avg",
+        "daily": "daily_avg",
+        "ручной": "manual",
+        "фикс": "fixed",
+        "средний": "daily_avg",
+    }
+    return mapping.get(text.strip().lower())
+
+
+def current_reminder_offsets(subscription: Subscription) -> List[int]:
+    return normalize_reminder_offsets(subscription.reminder_offsets or [subscription.remind_before_days, 0])
+
+
+def max_reminder_window(subscription: Subscription) -> int:
+    offsets = current_reminder_offsets(subscription)
+    return max(offsets) if offsets else 0
+
+
+def is_snoozed(subscription: Subscription, today: Optional[date] = None) -> bool:
+    target = today or today_local()
+    return subscription.snoozed_until is not None and target <= subscription.snoozed_until
+
+
+def date_to_iso(value: Optional[date]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def datetime_to_iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def parse_iso_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    return date.fromisoformat(value)
+
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def subscription_to_dict(subscription: Subscription) -> dict:
+    return {
+        "id": subscription.id,
+        "name": subscription.name,
+        "kind": subscription.kind,
+        "amount": subscription.amount,
+        "currency": subscription.currency,
+        "project": subscription.project,
+        "notes": subscription.notes,
+        "created_at": datetime_to_iso(subscription.created_at),
+        "active": subscription.active,
+        "next_charge_date": date_to_iso(subscription.next_charge_date),
+        "remind_before_days": subscription.remind_before_days,
+        "current_balance": subscription.current_balance,
+        "min_balance": subscription.min_balance,
+        "balance_updated_at": date_to_iso(subscription.balance_updated_at),
+        "spending_mode": subscription.spending_mode,
+        "spend_amount": subscription.spend_amount,
+        "spend_period_days": subscription.spend_period_days,
+        "reminder_offsets": current_reminder_offsets(subscription),
+        "repeat_daily_until_paid": subscription.repeat_daily_until_paid,
+        "snoozed_until": date_to_iso(subscription.snoozed_until),
+    }
+
+
+def subscription_from_dict(data: dict) -> Subscription:
+    reminder_offsets = data.get("reminder_offsets")
+    if reminder_offsets is None:
+        legacy = data.get("remind_before_days", 3)
+        reminder_offsets = normalize_reminder_offsets([legacy, 0])
+    return Subscription(
+        id=data["id"],
+        name=data["name"],
+        kind=data["kind"],
+        amount=float(data["amount"]),
+        currency=data["currency"],
+        project=data.get("project", "Личное"),
+        notes=data.get("notes", ""),
+        created_at=parse_iso_datetime(data.get("created_at")) or now_local(),
+        active=bool(data.get("active", True)),
+        next_charge_date=parse_iso_date(data.get("next_charge_date")),
+        remind_before_days=int(data.get("remind_before_days", 3)),
+        current_balance=data.get("current_balance"),
+        min_balance=data.get("min_balance"),
+        balance_updated_at=parse_iso_date(data.get("balance_updated_at")),
+        spending_mode=data.get("spending_mode"),
+        spend_amount=data.get("spend_amount"),
+        spend_period_days=data.get("spend_period_days"),
+        reminder_offsets=normalize_reminder_offsets(reminder_offsets),
+        repeat_daily_until_paid=bool(data.get("repeat_daily_until_paid", True)),
+        snoozed_until=parse_iso_date(data.get("snoozed_until")),
+    )
+
+
+def expense_event_to_dict(event: ExpenseEvent) -> dict:
+    return {
+        "timestamp": datetime_to_iso(event.timestamp),
+        "subscription_id": event.subscription_id,
+        "subscription_name": event.subscription_name,
+        "amount": event.amount,
+        "currency": event.currency,
+        "project": event.project,
+        "event_type": event.event_type,
+        "note": event.note,
+    }
+
+
+def expense_event_from_dict(data: dict) -> ExpenseEvent:
+    return ExpenseEvent(
+        timestamp=parse_iso_datetime(data.get("timestamp")) or now_local(),
+        subscription_id=data.get("subscription_id", ""),
+        subscription_name=data.get("subscription_name", ""),
+        amount=float(data.get("amount", 0)),
+        currency=data.get("currency", "USD"),
+        project=data.get("project", "Личное"),
+        event_type=data.get("event_type", "payment"),
+        note=data.get("note", ""),
+    )
+
+
+def user_store_to_dict(store: UserStore) -> dict:
+    return {
+        "user_id": store.user_id,
+        "chat_id": store.chat_id,
+        "subscriptions": {key: subscription_to_dict(value) for key, value in store.subscriptions.items()},
+        "history": [expense_event_to_dict(item) for item in store.history],
+        "sent_alerts": {key: date_to_iso(value) for key, value in store.sent_alerts.items()},
+    }
+
+
+def user_store_from_dict(data: dict) -> UserStore:
+    store = UserStore(user_id=int(data["user_id"]), chat_id=data.get("chat_id"))
+    store.subscriptions = {key: subscription_from_dict(value) for key, value in data.get("subscriptions", {}).items()}
+    store.history = [expense_event_from_dict(item) for item in data.get("history", [])]
+    store.sent_alerts = {key: parse_iso_date(value) or today_local() for key, value in data.get("sent_alerts", {}).items()}
+    return store
+
+
+def user_activity_to_dict(activity: UserActivity) -> dict:
+    return {
+        "user_id": activity.user_id,
+        "username": activity.username,
+        "full_name": activity.full_name,
+        "chat_id": activity.chat_id,
+        "first_seen_at": datetime_to_iso(activity.first_seen_at),
+        "last_seen_at": datetime_to_iso(activity.last_seen_at),
+        "message_count": activity.message_count,
+        "command_count": activity.command_count,
+        "callback_count": activity.callback_count,
+        "start_count": activity.start_count,
+        "last_action": activity.last_action,
+    }
+
+
+def user_activity_from_dict(data: dict) -> UserActivity:
+    return UserActivity(
+        user_id=int(data["user_id"]),
+        username=data.get("username", ""),
+        full_name=data.get("full_name", ""),
+        chat_id=data.get("chat_id"),
+        first_seen_at=parse_iso_datetime(data.get("first_seen_at")),
+        last_seen_at=parse_iso_datetime(data.get("last_seen_at")),
+        message_count=int(data.get("message_count", 0)),
+        command_count=int(data.get("command_count", 0)),
+        callback_count=int(data.get("callback_count", 0)),
+        start_count=int(data.get("start_count", 0)),
+        last_action=data.get("last_action", ""),
+    )
+
+
+def save_state() -> None:
+    payload = {
+        "users": {str(user_id): user_store_to_dict(store) for user_id, store in RUNTIME_USERS.items()},
+        "activity": {str(user_id): user_activity_to_dict(activity) for user_id, activity in USER_ACTIVITY_LOG.items()},
+    }
+    target = Path(DATA_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+
+
+def load_state() -> None:
+    target = Path(DATA_FILE)
+    if not target.exists():
+        return
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Could not load state from %s: %s", DATA_FILE, exc)
+        return
+
+    RUNTIME_USERS.clear()
+    USER_ACTIVITY_LOG.clear()
+    for user_id, store_data in payload.get("users", {}).items():
+        try:
+            RUNTIME_USERS[int(user_id)] = user_store_from_dict(store_data)
+        except Exception as exc:
+            LOGGER.warning("Skip broken user store %s: %s", user_id, exc)
+    for user_id, activity_data in payload.get("activity", {}).items():
+        try:
+            USER_ACTIVITY_LOG[int(user_id)] = user_activity_from_dict(activity_data)
+        except Exception as exc:
+            LOGGER.warning("Skip broken user activity %s: %s", user_id, exc)
 
 
 def now_local() -> datetime:
@@ -265,6 +531,7 @@ def track_user_activity(update: Update) -> None:
         command = raw_text.split()[0].lower()
         if command == '/start':
             activity.start_count += 1
+    save_state()
 
 
 def format_dt(value: Optional[datetime]) -> str:
@@ -524,6 +791,8 @@ def balance_projection_lines(subscription: Subscription) -> List[str]:
 def subscription_status(subscription: Subscription) -> str:
     if not subscription.active:
         return "⏸ Пауза"
+    if is_snoozed(subscription):
+        return f"🔕 Отложено до {subscription.snoozed_until.strftime('%d.%m.%Y')}"
     if subscription.kind == "balance":
         current_balance = effective_balance(subscription)
         if (
@@ -543,7 +812,7 @@ def subscription_status(subscription: Subscription) -> str:
         return f"🔴 Просрочено на {abs(delta)} дн."
     if delta == 0:
         return "🟠 Списание сегодня"
-    if delta <= subscription.remind_before_days:
+    if delta <= max_reminder_window(subscription):
         return f"🟡 Скоро списание ({delta} дн.)"
     return "🟢 Активна"
 
@@ -573,7 +842,14 @@ def render_subscription(subscription: Subscription) -> str:
             lines.append(
                 f"Следующее списание: {subscription.next_charge_date.strftime('%d.%m.%Y')}"
             )
-        lines.append(f"Напомнить за: {subscription.remind_before_days} дн.")
+        lines.append(f"Напоминания: {format_reminder_offsets(current_reminder_offsets(subscription))} дн.")
+        lines.append(
+            "Просрочка: напоминать ежедневно до оплаты"
+            if subscription.repeat_daily_until_paid
+            else "Просрочка: без ежедневного повтора"
+        )
+    if subscription.snoozed_until is not None and subscription.snoozed_until >= today_local():
+        lines.append(f"Напоминания отложены до: {subscription.snoozed_until.strftime('%d.%m.%Y')}")
     if subscription.notes:
         lines.append(f"Заметка: {escape(subscription.notes)}")
     return "\n".join(lines)
@@ -667,22 +943,38 @@ def record_history(
 def build_inline_actions(subscription: Subscription) -> InlineKeyboardMarkup:
     pause_text = "Возобновить" if not subscription.active else "Пауза"
     pause_action = "resume" if not subscription.active else "pause"
+    if subscription.kind == "balance":
+        rows = [
+            [
+                InlineKeyboardButton("💸 Пополнил", callback_data=f"pay:{subscription.id}"),
+                InlineKeyboardButton("🪫 Изм. баланс", callback_data=f"setbalance:{subscription.id}"),
+            ],
+            [
+                InlineKeyboardButton("🧾 История", callback_data=f"historysub:{subscription.id}"),
+                InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{subscription.id}"),
+            ],
+            [
+                InlineKeyboardButton("⏰ Отложить", callback_data=f"snooze:{subscription.id}"),
+                InlineKeyboardButton(f"⏯ {pause_text}", callback_data=f"{pause_action}:{subscription.id}"),
+            ],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
     rows = [
-        [InlineKeyboardButton("💸 Оплатить", callback_data=f"pay:{subscription.id}")],
+        [
+            InlineKeyboardButton("💸 Оплатил", callback_data=f"pay:{subscription.id}"),
+            InlineKeyboardButton("🧾 История", callback_data=f"historysub:{subscription.id}"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{subscription.id}"),
+            InlineKeyboardButton("⏰ Отложить", callback_data=f"snooze:{subscription.id}"),
+        ],
         [
             InlineKeyboardButton(f"⏯ {pause_text}", callback_data=f"{pause_action}:{subscription.id}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{subscription.id}"),
         ],
     ]
-    if subscription.kind == "balance":
-        rows.insert(
-            1,
-            [
-                InlineKeyboardButton(
-                    "🪫 Обновить баланс", callback_data=f"setbalance:{subscription.id}"
-                )
-            ],
-        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -736,8 +1028,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• прогнозировать падение баланса по модели расхода\n"
         "• сигналить, когда баланс ниже порога или скоро упрётся в него\n"
         "• фиксировать оплаты и пополнения\n"
-        "• показывать сводку, отчёт и историю трат\n\n"
-        "Важно: данные хранятся только в памяти процесса. После перезапуска всё сбросится."
+        "• показывать сводку, отчёт и историю трат\n"
+        "• редактировать подписки и смотреть историю по каждой подписке\n\n"
+        f"Данные сохраняются локально в JSON: {escape(DATA_FILE)}"
     )
     if not store.subscriptions:
         message += "\n\nДля быстрого теста можешь запустить /demo."
@@ -756,6 +1049,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/topup — сервисы с низким балансом и прогнозом\n"
         "/pay — отметить оплату или пополнение\n"
         "/setbalance — обновить текущий баланс\n"
+        "/edit — изменить подписку\n"
         "/dashboard — общая сводка\n"
         "/report — отчёт за текущий месяц\n"
         "/history — история последних трат\n"
@@ -884,6 +1178,7 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
     for subscription in samples:
         store.subscriptions[subscription.id] = subscription
+    save_state()
 
     await update.message.reply_text(
         "Добавил демо-набор с месячной подпиской, годовым сервисом и двумя балансовыми моделями.",
@@ -896,6 +1191,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
     context.user_data.pop("pending_balance_id", None)
+    context.user_data.pop("pending_edit_id", None)
+    context.user_data.pop("pending_edit_field", None)
     await update.message.reply_text("Диалог отменён.", reply_markup=MENU)
     return ConversationHandler.END
 
@@ -993,18 +1290,31 @@ async def add_next_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ADD_NEXT_DATE
     context.user_data["pending_subscription"]["next_charge_date"] = value
     await update.message.reply_text(
-        "За сколько дней до списания напоминать?\nНапример: 3",
-        reply_markup=ReplyKeyboardMarkup([["3", "7", "14"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        "Введи дни напоминаний через запятую.\nПример: 7,3,1,0",
+        reply_markup=ReplyKeyboardMarkup([["7,3,1,0"], ["3,1,0"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
     )
     return ADD_REMIND_DAYS
 
 
 async def add_remind_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    days = parse_int(update.message.text)
-    if days is None:
-        await update.message.reply_text("Введи целое число. Например: 3")
+    offsets = parse_reminder_offsets(update.message.text)
+    if offsets is None:
+        await update.message.reply_text("Введи список дней через запятую. Например: 7,3,1,0")
         return ADD_REMIND_DAYS
-    context.user_data["pending_subscription"]["remind_before_days"] = days
+    context.user_data["pending_subscription"]["reminder_offsets"] = offsets
+    await update.message.reply_text(
+        "Если дата уже пройдёт, напоминать каждый день до оплаты?",
+        reply_markup=YES_NO_KEYBOARD,
+    )
+    return ADD_REPEAT_UNTIL_PAID
+
+
+async def add_repeat_until_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    repeat = parse_yes_no(update.message.text)
+    if repeat is None:
+        await update.message.reply_text("Ответь Да или Нет.", reply_markup=YES_NO_KEYBOARD)
+        return ADD_REPEAT_UNTIL_PAID
+    context.user_data["pending_subscription"]["repeat_daily_until_paid"] = repeat
     await update.message.reply_text(
         "Добавь заметку или отправь '-' чтобы пропустить.",
         reply_markup=YES_SKIP_KEYBOARD,
@@ -1127,15 +1437,18 @@ async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         notes=notes,
         created_at=now_local(),
         next_charge_date=pending.get("next_charge_date"),
-        remind_before_days=pending.get("remind_before_days", 3),
+        remind_before_days=(pending.get("reminder_offsets") or [3])[0],
         current_balance=pending.get("current_balance"),
         min_balance=pending.get("min_balance"),
         balance_updated_at=pending.get("balance_updated_at"),
         spending_mode=pending.get("spending_mode"),
         spend_amount=pending.get("spend_amount"),
         spend_period_days=pending.get("spend_period_days"),
+        reminder_offsets=normalize_reminder_offsets(pending.get("reminder_offsets")),
+        repeat_daily_until_paid=pending.get("repeat_daily_until_paid", True),
     )
     store.subscriptions[subscription.id] = subscription
+    save_state()
 
     await update.message.reply_text(
         "Подписка сохранена:\n\n" + render_subscription(subscription),
@@ -1241,6 +1554,29 @@ EVENT_TYPE_LABELS = {
     "payment": "оплата",
     "topup": "пополнение",
 }
+
+
+def subscription_history_text(store: UserStore, subscription: Subscription) -> str:
+    events = [item for item in store.history if item.subscription_id == subscription.id]
+    month_start, month_end = current_month_bounds()
+    month_events = [item for item in events if month_start <= item.timestamp < month_end]
+    month_totals = summarize_amounts(month_events)
+    lines = [
+        f"<b>История: {escape(subscription.name)}</b>",
+        f"Операций всего: {len(events)}",
+        f"За текущий месяц: {format_currency_totals(month_totals)}",
+        "",
+    ]
+    if not events:
+        lines.append("История пока пустая.")
+        return "\n".join(lines)
+    for event in sorted(events, key=lambda item: item.timestamp, reverse=True)[:10]:
+        label = EVENT_TYPE_LABELS.get(event.event_type, event.event_type)
+        note_part = f" — {escape(event.note)}" if event.note else ""
+        lines.append(
+            f"• {event.timestamp.strftime('%d.%m.%Y %H:%M')} — {format_money(event.amount, event.currency)} ({label}){note_part}"
+        )
+    return "\n".join(lines)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1409,6 +1745,8 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     record_history(store, subscription, amount, "payment")
     advance_next_charge(subscription)
+    subscription.snoozed_until = None
+    save_state()
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
     await update.message.reply_text(
@@ -1442,7 +1780,9 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         subscription.current_balance = new_balance
 
     subscription.balance_updated_at = today_local()
+    subscription.snoozed_until = None
     record_history(store, subscription, amount, "topup")
+    save_state()
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
     await update.message.reply_text(
@@ -1519,7 +1859,11 @@ async def set_balance_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     subscription.current_balance = value
     subscription.balance_updated_at = today_local()
+    subscription.snoozed_until = None
+    save_state()
     context.user_data.pop("pending_balance_id", None)
+    context.user_data.pop("pending_edit_id", None)
+    context.user_data.pop("pending_edit_field", None)
     await update.message.reply_text(
         "Баланс обновлён.\n\n" + render_subscription(subscription),
         parse_mode=ParseMode.HTML,
@@ -1549,13 +1893,264 @@ async def subscription_action_callback(update: Update, context: ContextTypes.DEF
     elif action == "resume":
         subscription.active = True
         text = f"Возобновил: {subscription.name}"
+    elif action == "snooze":
+        subscription.snoozed_until = today_local() + timedelta(days=1)
+        text = f"Отложил напоминания до {subscription.snoozed_until.strftime('%d.%m.%Y')}: {subscription.name}"
     elif action == "delete":
         del store.subscriptions[subscription_id]
         text = f"Удалил: {subscription.name}"
     else:
         text = "Неизвестное действие."
 
+    save_state()
     await query.message.reply_text(text, reply_markup=MENU)
+
+
+async def show_subscription_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    subscription_id = query.data.split(":", maxsplit=1)[1]
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription = store.subscriptions.get(subscription_id)
+    if subscription is None:
+        await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
+        return
+    await query.message.reply_text(
+        subscription_history_text(store, subscription),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_inline_actions(subscription),
+    )
+
+
+def build_edit_keyboard(subscription: Subscription) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("Название", callback_data=f"editfield:name:{subscription.id}"),
+            InlineKeyboardButton("Проект", callback_data=f"editfield:project:{subscription.id}"),
+        ],
+        [
+            InlineKeyboardButton("Сумма", callback_data=f"editfield:amount:{subscription.id}"),
+            InlineKeyboardButton("Валюта", callback_data=f"editfield:currency:{subscription.id}"),
+        ],
+        [InlineKeyboardButton("Заметка", callback_data=f"editfield:notes:{subscription.id}")],
+    ]
+    if subscription.kind == "balance":
+        rows.extend([
+            [
+                InlineKeyboardButton("Текущий баланс", callback_data=f"editfield:current_balance:{subscription.id}"),
+                InlineKeyboardButton("Мин. порог", callback_data=f"editfield:min_balance:{subscription.id}"),
+            ],
+            [
+                InlineKeyboardButton("Тип расхода", callback_data=f"editfield:spending_mode:{subscription.id}"),
+                InlineKeyboardButton("Сумма расхода", callback_data=f"editfield:spend_amount:{subscription.id}"),
+            ],
+            [InlineKeyboardButton("Период расхода", callback_data=f"editfield:spend_period_days:{subscription.id}")],
+        ])
+    else:
+        rows.extend([
+            [
+                InlineKeyboardButton("Дата списания", callback_data=f"editfield:next_charge_date:{subscription.id}"),
+                InlineKeyboardButton("Напоминания", callback_data=f"editfield:reminders:{subscription.id}"),
+            ],
+            [InlineKeyboardButton("Повтор просрочки", callback_data=f"editfield:repeat:{subscription.id}")],
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def edit_field_prompt(field_name: str, subscription: Subscription) -> str:
+    prompts = {
+        "name": "Введи новое название.",
+        "project": "Введи новый проект.",
+        "amount": "Введи новую сумму.",
+        "currency": "Введи валюту: KZT, RUB, EUR, USD или TRY.",
+        "notes": "Введи новую заметку или '-' чтобы очистить.",
+        "next_charge_date": "Введи новую дату списания. Формат: DD.MM.YYYY или YYYY-MM-DD",
+        "reminders": "Введи дни напоминаний через запятую. Пример: 7,3,1,0",
+        "repeat": "Повторять просрочку ежедневно? Ответь Да или Нет.",
+        "current_balance": "Введи новый текущий баланс.",
+        "min_balance": "Введи новый минимальный порог.",
+        "spending_mode": "Введи тип расхода: manual, fixed или daily_avg. Можно и по-русски: Ручной контроль / Фиксированное списание / Средний расход в день.",
+        "spend_amount": "Введи новую сумму расхода.",
+        "spend_period_days": "Введи новый период списания в днях.",
+    }
+    return prompts[field_name]
+
+
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update):
+        return ConversationHandler.END
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    if not store.subscriptions:
+        await update.message.reply_text("Подписок пока нет.", reply_markup=MENU)
+        return ConversationHandler.END
+    buttons = [[f"{subscription.name} [{subscription.id}]"] for subscription in sorted(store.subscriptions.values(), key=lambda x: x.name.lower())]
+    buttons.append(["/cancel"])
+    await update.message.reply_text(
+        "Выбери подписку для редактирования:",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return EDIT_SELECT
+
+
+async def edit_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update):
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    subscription_id = query.data.split(":", maxsplit=1)[1]
+    context.user_data["pending_edit_id"] = subscription_id
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription = store.subscriptions.get(subscription_id)
+    if subscription is None:
+        await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
+        return ConversationHandler.END
+    await query.message.reply_text(
+        "Что изменить?",
+        reply_markup=build_edit_keyboard(subscription),
+    )
+    return EDIT_FIELD
+
+
+async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    match = re.search(r"\[([0-9a-f]{8})\]$", update.message.text.strip())
+    if not match:
+        await update.message.reply_text("Выбери подписку кнопкой из списка.")
+        return EDIT_SELECT
+    subscription_id = match.group(1)
+    context.user_data["pending_edit_id"] = subscription_id
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription = store.subscriptions.get(subscription_id)
+    if subscription is None:
+        await update.message.reply_text("Подписка не найдена.", reply_markup=MENU)
+        return ConversationHandler.END
+    await update.message.reply_text("Что изменить?", reply_markup=build_edit_keyboard(subscription))
+    return EDIT_FIELD
+
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update):
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    _, field_name, subscription_id = query.data.split(":", maxsplit=2)
+    context.user_data["pending_edit_id"] = subscription_id
+    context.user_data["pending_edit_field"] = field_name
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription = store.subscriptions.get(subscription_id)
+    if subscription is None:
+        await query.message.reply_text("Подписка не найдена.", reply_markup=MENU)
+        return ConversationHandler.END
+    prompt = edit_field_prompt(field_name, subscription)
+    reply_markup = CURRENCY_KEYBOARD if field_name == "currency" else YES_NO_KEYBOARD if field_name == "repeat" else ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True)
+    await query.message.reply_text(prompt, reply_markup=reply_markup)
+    return EDIT_VALUE
+
+
+async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription_id = context.user_data.get("pending_edit_id")
+    field_name = context.user_data.get("pending_edit_field")
+    subscription = store.subscriptions.get(subscription_id)
+    if subscription is None or not field_name:
+        await update.message.reply_text("Не удалось продолжить редактирование. Запусти /edit ещё раз.", reply_markup=MENU)
+        return ConversationHandler.END
+
+    raw = update.message.text.strip()
+    try:
+        if field_name in {"name", "project"}:
+            if not raw:
+                raise ValueError("Значение не должно быть пустым.")
+            setattr(subscription, field_name, raw)
+        elif field_name == "amount":
+            value = parse_float(raw)
+            if value is None:
+                raise ValueError("Нужна корректная сумма.")
+            subscription.amount = value
+        elif field_name == "currency":
+            value = parse_currency_input(raw)
+            if value is None:
+                raise ValueError("Выбери KZT, RUB, EUR, USD или TRY.")
+            subscription.currency = value
+        elif field_name == "notes":
+            subscription.notes = "" if raw == "-" else raw
+        elif field_name == "next_charge_date":
+            value = parse_date_input(raw)
+            if value is None:
+                raise ValueError("Не смог распознать дату.")
+            subscription.next_charge_date = value
+            subscription.snoozed_until = None
+        elif field_name == "reminders":
+            value = parse_reminder_offsets(raw)
+            if value is None:
+                raise ValueError("Нужен список дней через запятую.")
+            subscription.reminder_offsets = value
+            subscription.remind_before_days = value[0]
+        elif field_name == "repeat":
+            value = parse_yes_no(raw)
+            if value is None:
+                raise ValueError("Ответь Да или Нет.")
+            subscription.repeat_daily_until_paid = value
+        elif field_name == "current_balance":
+            value = parse_float(raw)
+            if value is None:
+                raise ValueError("Нужна корректная сумма.")
+            subscription.current_balance = value
+            subscription.balance_updated_at = today_local()
+            subscription.snoozed_until = None
+        elif field_name == "min_balance":
+            value = parse_float(raw)
+            if value is None:
+                raise ValueError("Нужна корректная сумма.")
+            subscription.min_balance = value
+        elif field_name == "spending_mode":
+            value = parse_balance_mode_input(raw)
+            if value is None:
+                raise ValueError("Используй manual, fixed или daily_avg.")
+            subscription.spending_mode = value
+            if value == "manual":
+                subscription.spend_amount = None
+                subscription.spend_period_days = None
+            elif value == "daily_avg":
+                subscription.spend_period_days = 1
+        elif field_name == "spend_amount":
+            value = parse_float(raw)
+            if value is None:
+                raise ValueError("Нужна корректная сумма.")
+            subscription.spend_amount = value
+        elif field_name == "spend_period_days":
+            value = parse_int(raw)
+            if value is None or value <= 0:
+                raise ValueError("Нужно положительное число дней.")
+            subscription.spend_period_days = value
+        else:
+            raise ValueError("Неизвестное поле.")
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return EDIT_VALUE
+
+    save_state()
+    context.user_data.pop("pending_edit_id", None)
+    context.user_data.pop("pending_edit_field", None)
+    await update.message.reply_text(
+        "Подписка обновлена.\n\n" + render_subscription(subscription),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_inline_actions(subscription),
+    )
+    return ConversationHandler.END
 
 
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1585,11 +2180,12 @@ def build_alert_key(kind: str, subscription_id: str) -> str:
 
 
 async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = today_local()
     for store in RUNTIME_USERS.values():
         if store.chat_id is None:
             continue
         for subscription in store.subscriptions.values():
-            if not subscription.active:
+            if not subscription.active or is_snoozed(subscription, today):
                 continue
             if subscription.kind == "balance":
                 current_balance = effective_balance(subscription)
@@ -1598,9 +2194,9 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 if current_balance <= subscription.min_balance:
                     key = build_alert_key("low", subscription.id)
-                    if store.sent_alerts.get(key) == today_local():
+                    if store.sent_alerts.get(key) == today:
                         continue
-                    store.sent_alerts[key] = today_local()
+                    store.sent_alerts[key] = today
                     await context.bot.send_message(
                         chat_id=store.chat_id,
                         text=(
@@ -1609,14 +2205,15 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         parse_mode=ParseMode.HTML,
                         reply_markup=build_inline_actions(subscription),
                     )
+                    save_state()
                     continue
 
                 days_left = days_until_balance_threshold(subscription)
                 if days_left is not None and 0 < days_left <= BALANCE_WARNING_DAYS:
                     key = build_alert_key("balance_warn", subscription.id)
-                    if store.sent_alerts.get(key) == today_local():
+                    if store.sent_alerts.get(key) == today:
                         continue
-                    store.sent_alerts[key] = today_local()
+                    store.sent_alerts[key] = today
                     await context.bot.send_message(
                         chat_id=store.chat_id,
                         text=(
@@ -1626,17 +2223,22 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         parse_mode=ParseMode.HTML,
                         reply_markup=build_inline_actions(subscription),
                     )
+                    save_state()
                 continue
 
             if subscription.next_charge_date is None:
                 continue
-            delta = (subscription.next_charge_date - today_local()).days
-            if delta > subscription.remind_before_days:
+            delta = (subscription.next_charge_date - today).days
+            offsets = current_reminder_offsets(subscription)
+            should_send = delta in offsets
+            if delta < 0 and subscription.repeat_daily_until_paid:
+                should_send = True
+            if not should_send:
                 continue
             key = build_alert_key("due", subscription.id)
-            if store.sent_alerts.get(key) == today_local():
+            if store.sent_alerts.get(key) == today:
                 continue
-            store.sent_alerts[key] = today_local()
+            store.sent_alerts[key] = today
             if delta < 0:
                 prefix = f"🔴 Просрочено на {abs(delta)} дн."
             elif delta == 0:
@@ -1649,6 +2251,7 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_inline_actions(subscription),
             )
+            save_state()
 
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1702,6 +2305,7 @@ def add_handlers(application: Application) -> None:
             ADD_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_project)],
             ADD_NEXT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_next_date)],
             ADD_REMIND_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_remind_days)],
+            ADD_REPEAT_UNTIL_PAID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_repeat_until_paid)],
             ADD_CURRENT_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_current_balance)],
             ADD_MIN_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_min_balance)],
             ADD_BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_balance_mode)],
@@ -1744,6 +2348,22 @@ def add_handlers(application: Application) -> None:
         persistent=False,
     )
 
+
+    edit_conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("edit", edit_start),
+            CallbackQueryHandler(edit_from_callback, pattern=r"^edit:"),
+        ],
+        states={
+            EDIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select)],
+            EDIT_FIELD: [CallbackQueryHandler(edit_field_callback, pattern=r"^editfield:")],
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="edit_subscription",
+        persistent=False,
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("demo", demo_command))
@@ -1757,8 +2377,10 @@ def add_handlers(application: Application) -> None:
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
     application.add_handler(balance_conversation)
+    application.add_handler(edit_conversation)
+    application.add_handler(CallbackQueryHandler(show_subscription_history_callback, pattern=r"^historysub:"))
     application.add_handler(
-        CallbackQueryHandler(subscription_action_callback, pattern=r"^(pause|resume|delete):")
+        CallbackQueryHandler(subscription_action_callback, pattern=r"^(pause|resume|delete|snooze):")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
     application.add_error_handler(error_handler)
@@ -1783,6 +2405,7 @@ def main() -> None:
     if not TOKEN:
         raise RuntimeError("Не задан TG_BOT_API_KEY в .env")
 
+    load_state()
     defaults = Defaults(tzinfo=TZ)
     application = (
         ApplicationBuilder()
@@ -1793,7 +2416,7 @@ def main() -> None:
     )
     add_handlers(application)
     schedule_jobs(application)
-    LOGGER.info("Bot started in timezone %s", TIMEZONE_NAME)
+    LOGGER.info("Bot started in timezone %s | data file %s", TIMEZONE_NAME, DATA_FILE)
     application.run_polling()
 
 
