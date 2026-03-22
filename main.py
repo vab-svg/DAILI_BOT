@@ -186,7 +186,23 @@ class UserStore:
     sent_alerts: Dict[str, date] = field(default_factory=dict)
 
 
+@dataclass
+class UserActivity:
+    user_id: int
+    username: str = ""
+    full_name: str = ""
+    chat_id: Optional[int] = None
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    message_count: int = 0
+    command_count: int = 0
+    callback_count: int = 0
+    start_count: int = 0
+    last_action: str = ""
+
+
 RUNTIME_USERS: Dict[int, UserStore] = {}
+USER_ACTIVITY_LOG: Dict[int, UserActivity] = {}
 
 
 def now_local() -> datetime:
@@ -205,6 +221,56 @@ def get_store(user_id: int, chat_id: Optional[int] = None) -> UserStore:
     elif chat_id is not None:
         store.chat_id = chat_id
     return store
+
+
+def get_user_activity(user_id: int) -> UserActivity:
+    activity = USER_ACTIVITY_LOG.get(user_id)
+    if activity is None:
+        activity = UserActivity(user_id=user_id)
+        USER_ACTIVITY_LOG[user_id] = activity
+    return activity
+
+
+def track_user_activity(update: Update) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    activity = get_user_activity(user.id)
+    now = now_local()
+    if activity.first_seen_at is None:
+        activity.first_seen_at = now
+    activity.last_seen_at = now
+    activity.username = user.username or ""
+    activity.full_name = user.full_name or str(user.id)
+
+    chat = update.effective_chat
+    if chat is not None:
+        activity.chat_id = chat.id
+
+    if update.callback_query is not None:
+        activity.callback_count += 1
+        activity.last_action = update.callback_query.data or "callback"
+        return
+
+    message = update.effective_message
+    if message is None or message.text is None:
+        return
+
+    activity.message_count += 1
+    raw_text = message.text.strip()
+    activity.last_action = raw_text[:80]
+    if raw_text.startswith('/'):
+        activity.command_count += 1
+        command = raw_text.split()[0].lower()
+        if command == '/start':
+            activity.start_count += 1
+
+
+def format_dt(value: Optional[datetime]) -> str:
+    if value is None:
+        return '—'
+    return value.strftime('%d.%m.%Y %H:%M')
 
 
 def format_money(value: float, currency: str) -> str:
@@ -634,6 +700,28 @@ async def ensure_authorized(update: Update) -> bool:
     return False
 
 
+async def ensure_owner_access(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if OWNER_USER_ID is not None and user.id != OWNER_USER_ID:
+        text = 'Эта команда доступна только владельцу бота.'
+        if update.message:
+            await update.message.reply_text(text, reply_markup=MENU)
+        elif update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        return False
+    return True
+
+
+async def usage_message_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user_activity(update)
+
+
+async def usage_callback_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user_activity(update)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
@@ -671,10 +759,61 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/dashboard — общая сводка\n"
         "/report — отчёт за текущий месяц\n"
         "/history — история последних трат\n"
+        "/users — кто пользуется ботом\n"
         "/demo — добавить демо-набор подписок\n"
         "/cancel — отменить текущий диалог"
     )
     await update.message.reply_text(text, reply_markup=MENU)
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    if not await ensure_owner_access(update):
+        return
+
+    if not USER_ACTIVITY_LOG:
+        await update.message.reply_text("Пока нет данных по пользователям.", reply_markup=MENU)
+        return
+
+    activities = sorted(
+        USER_ACTIVITY_LOG.values(),
+        key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=TZ),
+        reverse=True,
+    )
+    today = today_local()
+    active_today = sum(1 for item in activities if item.last_seen_at and item.last_seen_at.date() == today)
+    total_messages = sum(item.message_count for item in activities)
+    total_commands = sum(item.command_count for item in activities)
+    lines = [
+        "<b>Пользователи бота</b>",
+        f"Всего пользователей: {len(activities)}",
+        f"Активны сегодня: {active_today}",
+        f"Всего сообщений: {total_messages}",
+        f"Всего команд: {total_commands}",
+        "",
+    ]
+
+    for index, item in enumerate(activities, start=1):
+        store = RUNTIME_USERS.get(item.user_id)
+        subscriptions_count = len(store.subscriptions) if store else 0
+        username_display = "@" + item.username if item.username else "—"
+        lines.extend([
+            f"<b>{index}. {escape(item.full_name or str(item.user_id))}</b>",
+            f"ID: <code>{item.user_id}</code> | username: {escape(username_display)}",
+            f"Первый вход: {format_dt(item.first_seen_at)}",
+            f"Последняя активность: {format_dt(item.last_seen_at)}",
+            f"Сообщений: {item.message_count} | Команд: {item.command_count} | Callback: {item.callback_count} | /start: {item.start_count}",
+            f"Подписок в боте: {subscriptions_count}",
+            f"Последнее действие: {escape(item.last_action or '—')}",
+            "",
+        ])
+
+    await update.message.reply_text(
+        "\n".join(lines).rstrip(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MENU,
+    )
 
 
 async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1547,6 +1686,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def add_handlers(application: Application) -> None:
+    application.add_handler(MessageHandler(filters.ALL, usage_message_tracker), group=-1)
+    application.add_handler(CallbackQueryHandler(usage_callback_tracker), group=-1)
+
     add_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
@@ -1605,6 +1747,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("demo", demo_command))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("soon", soon_command))
     application.add_handler(CommandHandler("topup", topup_command))
