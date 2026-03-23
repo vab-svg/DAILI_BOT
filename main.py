@@ -169,7 +169,7 @@ def keyboard_with_help(rows: list[list[str]]) -> ReplyKeyboardMarkup:
 
 
 def step_text(step: int, total: int, title: str, hint: str | None = None) -> str:
-    lines = [f"Шаг {step} из {total}", f"{title}:"]
+    lines = [f"Шаг {step}", f"{title}:"]
     if hint:
         lines.append(hint)
     return "\n".join(lines)
@@ -1651,10 +1651,25 @@ def record_history(
     )
 
 
+def apply_default_payment(store: UserStore, subscription: Subscription) -> None:
+    amount = float(subscription.amount)
+    if subscription.kind == "balance":
+        current = effective_balance(subscription) or 0.0
+        subscription.current_balance = current + amount
+        subscription.balance_updated_at = today_local()
+        record_history(store, subscription, amount, "topup")
+    else:
+        record_history(store, subscription, amount, "payment")
+        advance_next_charge(subscription)
+    subscription.snoozed_until = None
+    save_state()
+
+
 def build_inline_actions(subscription: Subscription) -> InlineKeyboardMarkup:
     pause_text = "Возобновить" if not subscription.active else "Пауза"
     pause_action = "resume" if not subscription.active else "pause"
     if subscription.kind == "balance":
+
         rows = [
             [
                 InlineKeyboardButton("💸 Пополнил", callback_data=f"pay:{subscription.id}"),
@@ -1944,7 +1959,15 @@ CONFIRM_CANCEL = "❌ Отмена"
 
 
 def pending_total_steps(pending: dict) -> int:
-    return 12 if pending.get("kind") == "balance" else 10
+    kind = pending.get("kind")
+    if kind != "balance":
+        return 12 if kind else 12
+    mode = pending.get("spending_mode")
+    if mode == "fixed":
+        return 15
+    if mode in {"manual", "daily"}:
+        return 14
+    return 14
 
 
 def pending_subscription_preview(pending: dict) -> str:
@@ -2104,7 +2127,7 @@ async def add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return maybe_state
     prompt = "Сумма подписки" if kind != "balance" else "Обычная сумма пополнения"
     await update.message.reply_text(
-        step_text(3, 10, prompt, "Только число"),
+        step_text(3, 10, prompt),
         reply_markup=keyboard_with_help([]),
     )
     return ADD_AMOUNT
@@ -2123,7 +2146,7 @@ async def add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if maybe_state is not None:
         return maybe_state
     await update.message.reply_text(
-        step_text(4, 10, "Валюта", "Выбери кнопку или введи код"),
+        step_text(4, 10, "Валюта"),
         reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]),
     )
     return ADD_CURRENCY
@@ -2136,7 +2159,7 @@ async def add_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     currency = parse_currency_input(update.message.text)
     if currency is None:
         await update.message.reply_text(
-            step_text(4, 10, "Валюта", "Выбери кнопку или введи код"),
+            step_text(4, 10, "Валюта"),
             reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]),
         )
         return ADD_CURRENCY
@@ -2145,7 +2168,7 @@ async def add_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if maybe_state is not None:
         return maybe_state
     await update.message.reply_text(
-        step_text(5, 10, "Проект или группа", "Например: Личное, Работа, Bot A"),
+        step_text(5, 10, "Проект или группа"),
         reply_markup=keyboard_with_help([["Все проекты", "Личное"]]),
     )
     return ADD_PROJECT
@@ -2202,7 +2225,7 @@ async def add_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return maybe_state
     if pending["kind"] == "balance":
         await update.message.reply_text(
-            step_text(8, 10, "Текущий баланс", "Только число"),
+            step_text(8, 10, "Текущий баланс"),
             reply_markup=keyboard_with_help([]),
         )
         return ADD_CURRENT_BALANCE
@@ -2337,13 +2360,13 @@ async def add_balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if mode == "fixed":
         await update.message.reply_text(
-            step_text(11, 13, "Сумма списания", "Только число"),
+            step_text(11, 13, "Сумма списания"),
             reply_markup=keyboard_with_help([]),
         )
         return ADD_SPEND_AMOUNT
 
     await update.message.reply_text(
-        step_text(11, 13, "Расход в день", "Только число"),
+        step_text(11, 13, "Расход в день"),
         reply_markup=keyboard_with_help([]),
     )
     return ADD_SPEND_AMOUNT
@@ -3008,7 +3031,19 @@ async def pay_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     query = update.callback_query
     await query.answer()
-    subscription_id = query.data.split(":", maxsplit=1)[1]
+    action, subscription_id = query.data.split(":", maxsplit=1)
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
+    if subscription is None:
+        await query.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        return ConversationHandler.END
+    if action == "paydefault":
+        apply_default_payment(store, subscription)
+        text = "Пополнение сохранено.\n\n" if subscription.kind == "balance" else "Оплата сохранена.\n\n"
+        await query.message.reply_text(text + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=MENU)
+        return ConversationHandler.END
     context.user_data["pending_payment_id"] = subscription_id
     await query.message.reply_text(
         "Введи сумму оплаты или пополнения.",
@@ -3697,7 +3732,7 @@ def add_handlers(application: Application) -> None:
         entry_points=[
             CommandHandler("pay", pay_start),
             MessageHandler(filters.Regex(r"^💸 Отметить оплату$"), pay_start),
-            CallbackQueryHandler(pay_from_callback, pattern=r"^pay:"),
+            CallbackQueryHandler(pay_from_callback, pattern=r"^(pay|paydefault):"),
         ],
         states={
             PAY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_select)],
