@@ -48,17 +48,9 @@ LOGGER = logging.getLogger("subscription_bot")
 
 
 ACTIVE_UI_MESSAGES: dict[int, int] = {}
-TRACK_STATE: dict[int, dict] = {}
+ACTIVE_PAIRS: dict[int, dict] = {}
 _ORIGINAL_MESSAGE_REPLY_TEXT = Message.reply_text
-
-
-def _track(chat_id: int) -> dict:
-    return TRACK_STATE.setdefault(chat_id, {
-        "current_user": None,
-        "previous_user": None,
-        "current_bot": [],
-        "previous_bot": [],
-    })
+_ORIGINAL_MESSAGE_REPLY_DOCUMENT = Message.reply_document
 
 
 def remember_active_ui(chat_id: int, message_id: int) -> None:
@@ -73,60 +65,72 @@ def forget_active_ui(chat_id: int, message_id: int | None = None) -> None:
         ACTIVE_UI_MESSAGES.pop(chat_id, None)
 
 
-async def _safe_delete_by_id(bot, chat_id: int, message_id: int | None) -> None:
-    if not message_id:
+def get_pair(chat_id: int) -> dict:
+    return ACTIVE_PAIRS.setdefault(chat_id, {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False})
+
+
+async def delete_current_pair(bot, chat_id: int) -> None:
+    pair = ACTIVE_PAIRS.get(chat_id)
+    if not pair:
         return
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
-    forget_active_ui(chat_id, message_id)
+    if pair.get("sticky"):
+        ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
+        return
+    user_message_id = pair.get("user_message_id")
+    if user_message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=user_message_id)
+        except Exception:
+            pass
+    for message_id in list(pair.get("bot_message_ids", [])):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        forget_active_ui(chat_id, message_id)
+    ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
 
 
-async def _delete_tracked_previous(bot, chat_id: int) -> None:
-    state = _track(chat_id)
-    await _safe_delete_by_id(bot, chat_id, state.get("previous_user"))
-    for msg_id in list(state.get("previous_bot", [])):
-        await _safe_delete_by_id(bot, chat_id, msg_id)
-    state["previous_user"] = None
-    state["previous_bot"] = []
-
-
-def _is_file_message(message: Message | None) -> bool:
-    if message is None:
-        return False
-    return any(getattr(message, attr, None) is not None for attr in ("document", "photo", "video", "audio", "voice", "sticker", "animation"))
+def should_sticky_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return False
 
 
 async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
         return
-    state = _track(chat.id)
-    await _delete_tracked_previous(context.bot, chat.id)
-
-    # shift current pair to previous pair
-    state["previous_user"] = state.get("current_user")
-    state["previous_bot"] = list(state.get("current_bot", []))
-    state["current_user"] = None
-    state["current_bot"] = []
-
-    if update.message is not None and not _is_file_message(update.message):
-        # user text/commands should not stay in chat: delete them immediately
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-        state["current_user"] = None
-    elif update.callback_query is not None and update.callback_query.message is not None:
-        state["current_bot"] = [update.callback_query.message.message_id]
-        remember_active_ui(chat.id, update.callback_query.message.message_id)
+    pair = get_pair(chat.id)
+    if update.message is not None:
+        action_id = f"m:{update.message.message_id}"
+        if pair.get("action_id") != action_id:
+            await delete_current_pair(context.bot, chat.id)
+            keep_user_message = update.message.document is None
+            ACTIVE_PAIRS[chat.id] = {
+                "action_id": action_id,
+                "user_message_id": update.message.message_id if keep_user_message else None,
+                "bot_message_ids": [],
+                "sticky": should_sticky_action(update, context),
+            }
+    elif update.callback_query is not None:
+        action_id = f"c:{update.callback_query.id}"
+        if pair.get("action_id") != action_id:
+            await delete_current_pair(context.bot, chat.id)
+            source_message_id = update.callback_query.message.message_id if update.callback_query.message else None
+            ACTIVE_PAIRS[chat.id] = {
+                "action_id": action_id,
+                "user_message_id": None,
+                "bot_message_ids": [source_message_id] if source_message_id else [],
+                "sticky": False,
+            }
+            if source_message_id:
+                remember_active_ui(chat.id, source_message_id)
 
 
 def append_pair_bot_message(chat_id: int, message_id: int) -> None:
-    state = _track(chat_id)
-    if message_id not in state["current_bot"]:
-        state["current_bot"].append(message_id)
+    pair = get_pair(chat_id)
+    ids = pair.setdefault("bot_message_ids", [])
+    if message_id not in ids:
+        ids.append(message_id)
 
 
 async def _compact_reply_text(self: Message, *args, **kwargs):
@@ -134,28 +138,46 @@ async def _compact_reply_text(self: Message, *args, **kwargs):
     if chat is None:
         return await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
 
-    if not _is_file_message(self):
-        state = _track(chat.id)
-        # if reply_text is called without ui_send/start_new_action, rotate the pair and delete the user text
-        if state.get("current_user") != self.message_id:
-            await _delete_tracked_previous(self.get_bot(), chat.id)
-            state["previous_user"] = state.get("current_user")
-            state["previous_bot"] = list(state.get("current_bot", []))
-            state["current_user"] = None
-            state["current_bot"] = []
+    text = args[0] if args else kwargs.get("text", "")
+    reply_markup = kwargs.get("reply_markup")
+    parse_mode = kwargs.get("parse_mode")
+    disable_web_page_preview = kwargs.get("disable_web_page_preview", True)
+    force_new = kwargs.pop("force_new", False)
+
+    if not isinstance(reply_markup, ReplyKeyboardMarkup):
+        active_id = ACTIVE_UI_MESSAGES.get(chat.id)
+        if active_id and not force_new:
             try:
-                await self.delete()
+                sent = await self.get_bot().edit_message_text(
+                    chat_id=chat.id,
+                    message_id=active_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+                remember_active_ui(chat.id, sent.message_id)
+                return sent
             except Exception:
                 pass
 
     sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
-    if not _is_file_message(sent):
-        append_pair_bot_message(chat.id, sent.message_id)
+    append_pair_bot_message(chat.id, sent.message_id)
+    if not isinstance(reply_markup, ReplyKeyboardMarkup):
         remember_active_ui(chat.id, sent.message_id)
     return sent
 
 
+async def _compact_reply_document(self: Message, *args, **kwargs):
+    sent = await _ORIGINAL_MESSAGE_REPLY_DOCUMENT(self, *args, **kwargs)
+    chat = self.chat
+    if chat is not None:
+        append_pair_bot_message(chat.id, sent.message_id)
+    return sent
+
+
 Message.reply_text = _compact_reply_text
+Message.reply_document = _compact_reply_document
 
 # Suppress a noisy PTB warning for mixed message/callback conversations.
 # The bot intentionally starts some conversations from inline buttons and continues in chat.
@@ -185,19 +207,19 @@ DEFAULT_REMINDER_OFFSETS = [7, 3, 1, 0]
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-MENU = ReplyKeyboardMarkup(
-    [
-        ["➕ Добавить", "📋 Подписки"],
-        ["📅 Сегодня", "⏰ Скоро списания"],
-        ["🪫 Низкий баланс", "💸 Отметить оплату"],
-        ["💼 Сводка", "🔮 Прогноз"],
-        ["🗓 События на год"],
-        ["📈 Отчёт", "🧾 История"],
-        ["🗃 Архив", "📤 Экспорт"],
-        ["❓ Помощь"],
-    ],
-    resize_keyboard=True,
-)
+def build_main_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("➕ Добавить", callback_data="menu:add"), InlineKeyboardButton("📋 Подписки", callback_data="menu:list")],
+        [InlineKeyboardButton("📅 Сегодня", callback_data="menu:today"), InlineKeyboardButton("⏰ Скоро", callback_data="menu:soon")],
+        [InlineKeyboardButton("🪫 Низкий баланс", callback_data="menu:topup"), InlineKeyboardButton("💸 Оплата", callback_data="menu:pay")],
+        [InlineKeyboardButton("💼 Сводка", callback_data="menu:dashboard"), InlineKeyboardButton("🔮 Прогноз", callback_data="menu:forecast")],
+        [InlineKeyboardButton("🗓 Год", callback_data="menu:year"), InlineKeyboardButton("📈 Отчёт", callback_data="menu:report")],
+        [InlineKeyboardButton("🧾 История", callback_data="menu:history"), InlineKeyboardButton("🗃 Архив", callback_data="menu:archive")],
+        [InlineKeyboardButton("📤 Экспорт", callback_data="menu:export"), InlineKeyboardButton("❓ Помощь", callback_data="menu:help")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+MENU = build_main_menu()
 
 KIND_LABELS = {
     "monthly": "Ежемесячная",
@@ -2964,7 +2986,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     if not store.history:
-        await ui_send(update, context, "История пока пустая.", reply_markup=MENU)
+        await update.message.reply_text("История пока пустая.", reply_markup=MENU)
         return
     lines = ["Последние траты:"]
     for event in sorted(store.history, key=lambda item: item.timestamp, reverse=True)[:15]:
@@ -2973,7 +2995,9 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"• {event.timestamp.strftime('%d.%m %H:%M')} — {escape(event.subscription_name)} — "
             f"{format_money(event.amount, event.currency)} ({label}, {escape(event.category)})"
         )
-    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
+    )
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3032,7 +3056,9 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"• {icon} {item['due_date'].strftime('%d.%m.%Y')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
             )
 
-    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
+    )
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3043,7 +3069,10 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     store = get_store(user.id, chat.id if chat else None)
     events = history_for_month(store)
     if not events:
-        await ui_send(update, context, "В этом месяце трат пока нет. После /pay здесь появится отчёт.", reply_markup=MENU)
+        await update.message.reply_text(
+            "В этом месяце трат пока нет. После /pay здесь появится отчёт.",
+            reply_markup=MENU,
+        )
         return
 
     totals = summarize_amounts(events)
@@ -3063,7 +3092,9 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for category, amounts in sorted(by_category.items()):
             lines.append(f"• {escape(category)} — {format_currency_totals(amounts)}")
 
-    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
+    )
 
 
 async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3092,7 +3123,7 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     store = get_store(user.id, chat.id if chat else None)
     start, end = last_seven_days_bounds()
     lines = build_period_summary_lines(store, 'Сводка за 7 дней', start, end)
-    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3103,7 +3134,7 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     store = get_store(user.id, chat.id if chat else None)
     start, end = current_month_bounds()
     lines = build_period_summary_lines(store, 'Сводка за месяц', start, end)
-    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3113,7 +3144,7 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     lines = build_forecast_lines(store, f'Прогнозируемые события на {FORECAST_DAYS} дн.', FORECAST_DAYS)
-    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3122,17 +3153,12 @@ async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard())
 
 
-async def year_menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_authorized(update):
-        return
-    query = update.callback_query
-    if query is not None:
-        try:
-            await query.answer()
-        except Exception:
-            pass
-    await start(update, context)
 
+
+async def year_menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
 
 async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
@@ -3157,13 +3183,12 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     lines = build_today_lines(store)
-    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
-    await start_new_action(update, context)
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
@@ -3197,18 +3222,12 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_authorized(update):
         return
     context.user_data['awaiting_import'] = True
-    await ui_send(
-        update,
-        context,
-        'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
-        reply_markup=MENU,
-    )
+    await ui_send(update, context, 'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.', reply_markup=MENU, force_new=True)
 
 
 async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
-    await start_new_action(update, context)
     if not context.user_data.get('awaiting_import'):
         return
     message = update.effective_message
@@ -3228,26 +3247,22 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
         if filename.endswith('.json'):
             payload = json.loads(raw.decode('utf-8'))
             active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
-            await ui_send(
-                update,
-                context,
-                f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
-                reply_markup=MENU,
-            )
+            await ui_send(update, context, f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.', reply_markup=MENU, force_new=True)
+            await safe_delete_message(message)
         elif filename.endswith('.csv'):
             imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
-            await ui_send(
-                update,
-                context,
+            await message.reply_text(
                 f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
                 reply_markup=MENU,
             )
         else:
-            await ui_send(update, context, 'Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
+            await ui_send(update, context, 'Поддерживаются только файлы .json и .csv.', reply_markup=MENU, force_new=True)
+            await safe_delete_message(message)
             return
     except Exception as exc:
         LOGGER.exception('Import failed: %s', exc)
-        await ui_send(update, context, f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
+        await ui_send(update, context, f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU, force_new=True)
+        await safe_delete_message(message)
         return
     finally:
         context.user_data['awaiting_import'] = False
@@ -4013,8 +4028,45 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             await target.reply_text("Произошла ошибка. Попробуй ещё раз или начни с /start.", reply_markup=MENU)
 
 
+
+
+async def auto_delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or message.from_user is None or message.from_user.is_bot:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(':', 1)[1]
+    mapping = {
+        'help': help_command,
+        'list': list_command,
+        'today': today_command,
+        'soon': soon_command,
+        'topup': topup_command,
+        'dashboard': dashboard_command,
+        'forecast': forecast_command,
+        'year': year_command,
+        'report': report_command,
+        'history': history_command,
+        'archive': archive_command,
+        'pay': pay_start,
+        'add': add_start,
+        'export': export_command,
+    }
+    handler = mapping.get(action)
+    if handler:
+        await handler(update, context)
+
 def add_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.ALL, usage_message_tracker), group=-1)
+    application.add_handler(MessageHandler((filters.TEXT | filters.COMMAND) & ~filters.UpdateType.EDITED, auto_delete_user_message), group=-2)
     application.add_handler(CallbackQueryHandler(usage_callback_tracker), group=-1)
 
     add_conversation = ConversationHandler(
@@ -4121,6 +4173,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("import", import_command))
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     application.add_handler(CallbackQueryHandler(year_month_callback, pattern=r"^yearmonth:"))
     application.add_handler(CallbackQueryHandler(year_menu_back_callback, pattern=r"^yearmenu:back$"))
     application.add_handler(balance_conversation)
