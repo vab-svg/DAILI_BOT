@@ -192,8 +192,10 @@ async def ui_send(
     if chat is None:
         return
 
+    uses_reply_keyboard = isinstance(reply_markup, ReplyKeyboardMarkup) or reply_markup is MENU
+
     query = update.callback_query
-    if query is not None and query.message is not None and not force_new:
+    if query is not None and query.message is not None and not force_new and not uses_reply_keyboard:
         try:
             sent = await query.message.edit_text(
                 text=text,
@@ -208,7 +210,7 @@ async def ui_send(
 
     ui_chat_id = context.user_data.get("ui_chat_id")
     ui_message_id = context.user_data.get("ui_message_id")
-    if ui_chat_id == chat.id and ui_message_id and not force_new:
+    if ui_chat_id == chat.id and ui_message_id and not force_new and not uses_reply_keyboard:
         try:
             await context.bot.edit_message_text(
                 chat_id=ui_chat_id,
@@ -224,7 +226,7 @@ async def ui_send(
         except Exception:
             pass
 
-    if ui_chat_id == chat.id and ui_message_id and force_new:
+    if ui_chat_id == chat.id and ui_message_id:
         try:
             await context.bot.delete_message(chat_id=ui_chat_id, message_id=ui_message_id)
         except Exception:
@@ -2539,10 +2541,7 @@ async def add_spend_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return maybe_state
 
     if pending.get("spending_mode") == "fixed":
-        await update.message.reply_text(
-            "Введи период списания в днях.\nНапример: 30",
-            reply_markup=ReplyKeyboardMarkup([["7", "30", "/cancel"]], resize_keyboard=True, one_time_keyboard=True),
-        )
+        await ui_send(update, context, "Введи период списания в днях.", reply_markup=ReplyKeyboardMarkup([["7", "30", "/cancel"]], resize_keyboard=True, one_time_keyboard=True))
         return ADD_SPEND_PERIOD
 
     pending["spend_period_days"] = 1
@@ -2651,11 +2650,7 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         store.subscriptions[subscription.id] = subscription
         save_state()
-        await update.message.reply_text(
-            "Готово, подписка сохранена ✅\n\n" + render_subscription(subscription),
-            parse_mode=ParseMode.HTML,
-            reply_markup=MENU,
-        )
+        await ui_send(update, context, "Готово, подписка сохранена ✅\n\n" + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     if text == CONFIRM_EDIT:
@@ -3019,7 +3014,7 @@ async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     lines = build_month_events_lines(store, year, month)
-    await query.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=build_year_month_keyboard())
+    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=build_year_month_keyboard())
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
