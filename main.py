@@ -3130,6 +3130,18 @@ async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard())
 
 
+async def year_menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    await start(update, context)
+
+
 async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
