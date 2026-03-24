@@ -103,7 +103,10 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         action_id = f"m:{update.message.message_id}"
         if pair.get("action_id") != action_id:
             await delete_current_pair(context.bot, chat.id)
-            keep_user_message = update.message.document is None
+            keep_user_message = all(
+                getattr(update.message, attr, None) is None
+                for attr in ("document", "photo", "video", "audio", "voice", "sticker", "animation")
+            )
             ACTIVE_PAIRS[chat.id] = {
                 "action_id": action_id,
                 "user_message_id": update.message.message_id if keep_user_message else None,
@@ -141,9 +144,13 @@ async def _compact_reply_text(self: Message, *args, **kwargs):
     pair = get_pair(chat.id)
     if pair.get("action_id") != action_id:
         await delete_current_pair(self.get_bot(), chat.id)
+        keep_user_message = all(
+            getattr(self, attr, None) is None
+            for attr in ("document", "photo", "video", "audio", "voice", "sticker", "animation")
+        )
         ACTIVE_PAIRS[chat.id] = {
             "action_id": action_id,
-            "user_message_id": self.message_id,
+            "user_message_id": self.message_id if keep_user_message else None,
             "bot_message_ids": [],
             "sticky": False,
         }
@@ -2963,7 +2970,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     if not store.history:
-        await update.message.reply_text("История пока пустая.", reply_markup=MENU)
+        await ui_send(update, context, "История пока пустая.", reply_markup=MENU)
         return
     lines = ["Последние траты:"]
     for event in sorted(store.history, key=lambda item: item.timestamp, reverse=True)[:15]:
@@ -2972,9 +2979,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"• {event.timestamp.strftime('%d.%m %H:%M')} — {escape(event.subscription_name)} — "
             f"{format_money(event.amount, event.currency)} ({label}, {escape(event.category)})"
         )
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
-    )
+    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3033,9 +3038,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"• {icon} {item['due_date'].strftime('%d.%m.%Y')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
             )
 
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
-    )
+    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3046,10 +3049,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     store = get_store(user.id, chat.id if chat else None)
     events = history_for_month(store)
     if not events:
-        await update.message.reply_text(
-            "В этом месяце трат пока нет. После /pay здесь появится отчёт.",
-            reply_markup=MENU,
-        )
+        await ui_send(update, context, "В этом месяце трат пока нет. После /pay здесь появится отчёт.", reply_markup=MENU)
         return
 
     totals = summarize_amounts(events)
@@ -3069,9 +3069,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for category, amounts in sorted(by_category.items()):
             lines.append(f"• {escape(category)} — {format_currency_totals(amounts)}")
 
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU
-    )
+    await ui_send(update, context, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3100,7 +3098,7 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     store = get_store(user.id, chat.id if chat else None)
     start, end = last_seven_days_bounds()
     lines = build_period_summary_lines(store, 'Сводка за 7 дней', start, end)
-    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3111,7 +3109,7 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     store = get_store(user.id, chat.id if chat else None)
     start, end = current_month_bounds()
     lines = build_period_summary_lines(store, 'Сводка за месяц', start, end)
-    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3121,7 +3119,7 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     lines = build_forecast_lines(store, f'Прогнозируемые события на {FORECAST_DAYS} дн.', FORECAST_DAYS)
-    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3165,12 +3163,13 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     lines = build_today_lines(store)
-    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+    await ui_send(update, context, '\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
+    await start_new_action(update, context)
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
@@ -3204,7 +3203,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_authorized(update):
         return
     context.user_data['awaiting_import'] = True
-    await update.message.reply_text(
+    await ui_send(
+        update,
+        context,
         'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
         reply_markup=MENU,
     )
@@ -3213,6 +3214,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
+    await start_new_action(update, context)
     if not context.user_data.get('awaiting_import'):
         return
     message = update.effective_message
@@ -3232,22 +3234,26 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
         if filename.endswith('.json'):
             payload = json.loads(raw.decode('utf-8'))
             active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
-            await message.reply_text(
+            await ui_send(
+                update,
+                context,
                 f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
                 reply_markup=MENU,
             )
         elif filename.endswith('.csv'):
             imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
-            await message.reply_text(
+            await ui_send(
+                update,
+                context,
                 f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
                 reply_markup=MENU,
             )
         else:
-            await message.reply_text('Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
+            await ui_send(update, context, 'Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
             return
     except Exception as exc:
         LOGGER.exception('Import failed: %s', exc)
-        await message.reply_text(f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
+        await ui_send(update, context, f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
     finally:
         context.user_data['awaiting_import'] = False
