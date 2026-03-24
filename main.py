@@ -64,16 +64,29 @@ def forget_active_ui(chat_id: int, message_id: int | None = None) -> None:
         ACTIVE_UI_MESSAGES.pop(chat_id, None)
 
 
+def _empty_pair() -> dict:
+    return {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
+
+
 def get_pair(chat_id: int) -> dict:
-    return ACTIVE_PAIRS.setdefault(chat_id, {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False})
+    return ACTIVE_PAIRS.setdefault(chat_id, _empty_pair())
 
 
-async def delete_current_pair(bot, chat_id: int) -> None:
-    pair = ACTIVE_PAIRS.get(chat_id)
+def _pair_clone(pair: dict | None) -> dict:
+    if not pair:
+        return _empty_pair()
+    return {
+        "action_id": pair.get("action_id"),
+        "user_message_id": pair.get("user_message_id"),
+        "bot_message_ids": list(pair.get("bot_message_ids", [])),
+        "sticky": bool(pair.get("sticky", False)),
+    }
+
+
+async def _delete_pair(bot, chat_id: int, pair: dict | None) -> None:
     if not pair:
         return
     if pair.get("sticky"):
-        ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
         return
     user_message_id = pair.get("user_message_id")
     if user_message_id:
@@ -82,12 +95,19 @@ async def delete_current_pair(bot, chat_id: int) -> None:
         except Exception:
             pass
     for message_id in list(pair.get("bot_message_ids", [])):
+        if not message_id:
+            continue
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception:
             pass
         forget_active_ui(chat_id, message_id)
-    ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
+
+
+async def delete_current_pair(bot, chat_id: int) -> None:
+    await _delete_pair(bot, chat_id, ACTIVE_PAIRS.get(chat_id))
+    ACTIVE_PAIRS[chat_id] = _empty_pair()
+    PAIR_HISTORY.pop(chat_id, None)
 
 
 def should_sticky_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -102,7 +122,10 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if update.message is not None:
         action_id = f"m:{update.message.message_id}"
         if pair.get("action_id") != action_id:
-            await delete_current_pair(context.bot, chat.id)
+            previous = _pair_clone(pair)
+            await _delete_pair(context.bot, chat.id, PAIR_HISTORY.pop(chat.id, None))
+            if previous.get("action_id"):
+                PAIR_HISTORY[chat.id] = previous
             keep_user_message = all(
                 getattr(update.message, attr, None) is None
                 for attr in ("document", "photo", "video", "audio", "voice", "sticker", "animation")
@@ -116,7 +139,10 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif update.callback_query is not None:
         action_id = f"c:{update.callback_query.id}"
         if pair.get("action_id") != action_id:
-            await delete_current_pair(context.bot, chat.id)
+            previous = _pair_clone(pair)
+            await _delete_pair(context.bot, chat.id, PAIR_HISTORY.pop(chat.id, None))
+            if previous.get("action_id"):
+                PAIR_HISTORY[chat.id] = previous
             source_message_id = update.callback_query.message.message_id if update.callback_query.message else None
             ACTIVE_PAIRS[chat.id] = {
                 "action_id": action_id,
