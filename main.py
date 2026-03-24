@@ -112,7 +112,12 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state["current_bot"] = []
 
     if update.message is not None and not _is_file_message(update.message):
-        state["current_user"] = update.message.message_id
+        # user text/commands should not stay in chat: delete them immediately
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        state["current_user"] = None
     elif update.callback_query is not None and update.callback_query.message is not None:
         state["current_bot"] = [update.callback_query.message.message_id]
         remember_active_ui(chat.id, update.callback_query.message.message_id)
@@ -131,13 +136,17 @@ async def _compact_reply_text(self: Message, *args, **kwargs):
 
     if not _is_file_message(self):
         state = _track(chat.id)
-        # if reply_text is called without ui_send/start_new_action, make this message the current user action
+        # if reply_text is called without ui_send/start_new_action, rotate the pair and delete the user text
         if state.get("current_user") != self.message_id:
             await _delete_tracked_previous(self.get_bot(), chat.id)
             state["previous_user"] = state.get("current_user")
             state["previous_bot"] = list(state.get("current_bot", []))
-            state["current_user"] = self.message_id
+            state["current_user"] = None
             state["current_bot"] = []
+            try:
+                await self.delete()
+            except Exception:
+                pass
 
     sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
     if not _is_file_message(sent):
