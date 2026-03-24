@@ -91,16 +91,6 @@ async def delete_current_pair(bot, chat_id: int) -> None:
 
 
 def should_sticky_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    message = update.message
-    if message is None:
-        return False
-    text = (message.text or '').strip().lower()
-    if text in {'/import', '/export', '📤 экспорт', 'экспорт'}:
-        return True
-    if message.document is not None:
-        return True
-    if context.user_data.get('awaiting_import'):
-        return True
     return False
 
 
@@ -113,9 +103,10 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         action_id = f"m:{update.message.message_id}"
         if pair.get("action_id") != action_id:
             await delete_current_pair(context.bot, chat.id)
+            keep_user_message = update.message.document is None
             ACTIVE_PAIRS[chat.id] = {
                 "action_id": action_id,
-                "user_message_id": update.message.message_id,
+                "user_message_id": update.message.message_id if keep_user_message else None,
                 "bot_message_ids": [],
                 "sticky": should_sticky_action(update, context),
             }
@@ -123,12 +114,15 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         action_id = f"c:{update.callback_query.id}"
         if pair.get("action_id") != action_id:
             await delete_current_pair(context.bot, chat.id)
+            source_message_id = update.callback_query.message.message_id if update.callback_query.message else None
             ACTIVE_PAIRS[chat.id] = {
                 "action_id": action_id,
                 "user_message_id": None,
-                "bot_message_ids": [],
+                "bot_message_ids": [source_message_id] if source_message_id else [],
                 "sticky": False,
             }
+            if source_message_id:
+                remember_active_ui(chat.id, source_message_id)
 
 
 def append_pair_bot_message(chat_id: int, message_id: int) -> None:
@@ -1355,6 +1349,7 @@ def build_year_month_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="yearmenu:back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3197,9 +3192,8 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_authorized(update):
         return
     context.user_data['awaiting_import'] = True
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text='Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
+    await update.message.reply_text(
+        'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
         reply_markup=MENU,
     )
 
@@ -3226,24 +3220,22 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
         if filename.endswith('.json'):
             payload = json.loads(raw.decode('utf-8'))
             active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                text=f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
+            await message.reply_text(
+                f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
                 reply_markup=MENU,
             )
         elif filename.endswith('.csv'):
             imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                text=f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
+            await message.reply_text(
+                f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
                 reply_markup=MENU,
             )
         else:
-            await context.bot.send_message(chat_id=message.chat_id, text='Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
+            await message.reply_text('Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
             return
     except Exception as exc:
         LOGGER.exception('Import failed: %s', exc)
-        await context.bot.send_message(chat_id=message.chat_id, text=f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
+        await message.reply_text(f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
     finally:
         context.user_data['awaiting_import'] = False
@@ -4118,6 +4110,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
     application.add_handler(CallbackQueryHandler(year_month_callback, pattern=r"^yearmonth:"))
+    application.add_handler(CallbackQueryHandler(year_menu_back_callback, pattern=r"^yearmenu:back$"))
     application.add_handler(balance_conversation)
     application.add_handler(edit_conversation)
     application.add_handler(MessageHandler(filters.Document.ALL, import_document_handler))
