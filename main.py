@@ -50,7 +50,6 @@ LOGGER = logging.getLogger("subscription_bot")
 ACTIVE_UI_MESSAGES: dict[int, int] = {}
 ACTIVE_PAIRS: dict[int, dict] = {}
 _ORIGINAL_MESSAGE_REPLY_TEXT = Message.reply_text
-_ORIGINAL_MESSAGE_REPLY_DOCUMENT = Message.reply_document
 
 
 def remember_active_ui(chat_id: int, message_id: int) -> None:
@@ -138,46 +137,24 @@ async def _compact_reply_text(self: Message, *args, **kwargs):
     if chat is None:
         return await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
 
-    text = args[0] if args else kwargs.get("text", "")
-    reply_markup = kwargs.get("reply_markup")
-    parse_mode = kwargs.get("parse_mode")
-    disable_web_page_preview = kwargs.get("disable_web_page_preview", True)
-    force_new = kwargs.pop("force_new", False)
-
-    if not isinstance(reply_markup, ReplyKeyboardMarkup):
-        active_id = ACTIVE_UI_MESSAGES.get(chat.id)
-        if active_id and not force_new:
-            try:
-                sent = await self.get_bot().edit_message_text(
-                    chat_id=chat.id,
-                    message_id=active_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=disable_web_page_preview,
-                )
-                remember_active_ui(chat.id, sent.message_id)
-                return sent
-            except Exception:
-                pass
+    action_id = f"m:{self.message_id}"
+    pair = get_pair(chat.id)
+    if pair.get("action_id") != action_id:
+        await delete_current_pair(self.get_bot(), chat.id)
+        ACTIVE_PAIRS[chat.id] = {
+            "action_id": action_id,
+            "user_message_id": self.message_id,
+            "bot_message_ids": [],
+            "sticky": False,
+        }
 
     sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
     append_pair_bot_message(chat.id, sent.message_id)
-    if not isinstance(reply_markup, ReplyKeyboardMarkup):
-        remember_active_ui(chat.id, sent.message_id)
-    return sent
-
-
-async def _compact_reply_document(self: Message, *args, **kwargs):
-    sent = await _ORIGINAL_MESSAGE_REPLY_DOCUMENT(self, *args, **kwargs)
-    chat = self.chat
-    if chat is not None:
-        append_pair_bot_message(chat.id, sent.message_id)
+    remember_active_ui(chat.id, sent.message_id)
     return sent
 
 
 Message.reply_text = _compact_reply_text
-Message.reply_document = _compact_reply_document
 
 # Suppress a noisy PTB warning for mixed message/callback conversations.
 # The bot intentionally starts some conversations from inline buttons and continues in chat.
@@ -207,19 +184,19 @@ DEFAULT_REMINDER_OFFSETS = [7, 3, 1, 0]
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-def build_main_menu() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("➕ Добавить", callback_data="menu:add"), InlineKeyboardButton("📋 Подписки", callback_data="menu:list")],
-        [InlineKeyboardButton("📅 Сегодня", callback_data="menu:today"), InlineKeyboardButton("⏰ Скоро", callback_data="menu:soon")],
-        [InlineKeyboardButton("🪫 Низкий баланс", callback_data="menu:topup"), InlineKeyboardButton("💸 Оплата", callback_data="menu:pay")],
-        [InlineKeyboardButton("💼 Сводка", callback_data="menu:dashboard"), InlineKeyboardButton("🔮 Прогноз", callback_data="menu:forecast")],
-        [InlineKeyboardButton("🗓 Год", callback_data="menu:year"), InlineKeyboardButton("📈 Отчёт", callback_data="menu:report")],
-        [InlineKeyboardButton("🧾 История", callback_data="menu:history"), InlineKeyboardButton("🗃 Архив", callback_data="menu:archive")],
-        [InlineKeyboardButton("📤 Экспорт", callback_data="menu:export"), InlineKeyboardButton("❓ Помощь", callback_data="menu:help")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-MENU = build_main_menu()
+MENU = ReplyKeyboardMarkup(
+    [
+        ["➕ Добавить", "📋 Подписки"],
+        ["📅 Сегодня", "⏰ Скоро списания"],
+        ["🪫 Низкий баланс", "💸 Отметить оплату"],
+        ["💼 Сводка", "🔮 Прогноз"],
+        ["🗓 События на год"],
+        ["📈 Отчёт", "🧾 История"],
+        ["🗃 Архив", "📤 Экспорт"],
+        ["❓ Помощь"],
+    ],
+    resize_keyboard=True,
+)
 
 KIND_LABELS = {
     "monthly": "Ежемесячная",
@@ -3153,12 +3130,17 @@ async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard())
 
 
-
-
 async def year_menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
     query = update.callback_query
-    await query.answer()
+    if query is not None:
+        try:
+            await query.answer()
+        except Exception:
+            pass
     await start(update, context)
+
 
 async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
@@ -3222,7 +3204,10 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_authorized(update):
         return
     context.user_data['awaiting_import'] = True
-    await ui_send(update, context, 'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.', reply_markup=MENU, force_new=True)
+    await update.message.reply_text(
+        'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
+        reply_markup=MENU,
+    )
 
 
 async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3247,8 +3232,10 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
         if filename.endswith('.json'):
             payload = json.loads(raw.decode('utf-8'))
             active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
-            await ui_send(update, context, f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.', reply_markup=MENU, force_new=True)
-            await safe_delete_message(message)
+            await message.reply_text(
+                f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
+                reply_markup=MENU,
+            )
         elif filename.endswith('.csv'):
             imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
             await message.reply_text(
@@ -3256,13 +3243,11 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=MENU,
             )
         else:
-            await ui_send(update, context, 'Поддерживаются только файлы .json и .csv.', reply_markup=MENU, force_new=True)
-            await safe_delete_message(message)
+            await message.reply_text('Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
             return
     except Exception as exc:
         LOGGER.exception('Import failed: %s', exc)
-        await ui_send(update, context, f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU, force_new=True)
-        await safe_delete_message(message)
+        await message.reply_text(f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
     finally:
         context.user_data['awaiting_import'] = False
@@ -4028,45 +4013,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             await target.reply_text("Произошла ошибка. Попробуй ещё раз или начни с /start.", reply_markup=MENU)
 
 
-
-
-async def auto_delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None or message.from_user is None or message.from_user.is_bot:
-        return
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(':', 1)[1]
-    mapping = {
-        'help': help_command,
-        'list': list_command,
-        'today': today_command,
-        'soon': soon_command,
-        'topup': topup_command,
-        'dashboard': dashboard_command,
-        'forecast': forecast_command,
-        'year': year_command,
-        'report': report_command,
-        'history': history_command,
-        'archive': archive_command,
-        'pay': pay_start,
-        'add': add_start,
-        'export': export_command,
-    }
-    handler = mapping.get(action)
-    if handler:
-        await handler(update, context)
-
 def add_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.ALL, usage_message_tracker), group=-1)
-    application.add_handler(MessageHandler((filters.TEXT | filters.COMMAND) & ~filters.UpdateType.EDITED, auto_delete_user_message), group=-2)
     application.add_handler(CallbackQueryHandler(usage_callback_tracker), group=-1)
 
     add_conversation = ConversationHandler(
@@ -4173,7 +4121,6 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("import", import_command))
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     application.add_handler(CallbackQueryHandler(year_month_callback, pattern=r"^yearmonth:"))
     application.add_handler(CallbackQueryHandler(year_menu_back_callback, pattern=r"^yearmenu:back$"))
     application.add_handler(balance_conversation)
