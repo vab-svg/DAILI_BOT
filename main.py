@@ -21,6 +21,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    Message,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -44,6 +45,49 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger("subscription_bot")
+
+
+ACTIVE_UI_MESSAGES: dict[int, int] = {}
+_ORIGINAL_MESSAGE_REPLY_TEXT = Message.reply_text
+
+
+def remember_active_ui(chat_id: int, message_id: int) -> None:
+    ACTIVE_UI_MESSAGES[chat_id] = message_id
+
+
+def forget_active_ui(chat_id: int, message_id: int | None = None) -> None:
+    if message_id is None:
+        ACTIVE_UI_MESSAGES.pop(chat_id, None)
+        return
+    if ACTIVE_UI_MESSAGES.get(chat_id) == message_id:
+        ACTIVE_UI_MESSAGES.pop(chat_id, None)
+
+
+async def _compact_reply_text(self: Message, *args, **kwargs):
+    chat = self.chat
+    if chat is None:
+        return await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
+
+    previous_id = ACTIVE_UI_MESSAGES.get(chat.id)
+    if previous_id:
+        try:
+            await self.get_bot().delete_message(chat_id=chat.id, message_id=previous_id)
+        except Exception:
+            pass
+        forget_active_ui(chat.id, previous_id)
+
+    sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
+    remember_active_ui(chat.id, sent.message_id)
+
+    if chat.type == 'private':
+        try:
+            await self.delete()
+        except Exception:
+            pass
+    return sent
+
+
+Message.reply_text = _compact_reply_text
 
 # Suppress a noisy PTB warning for mixed message/callback conversations.
 # The bot intentionally starts some conversations from inline buttons and continues in chat.
@@ -167,7 +211,11 @@ async def safe_delete_message(message) -> None:
     if message is None:
         return
     try:
+        chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "message_id", None)
         await message.delete()
+        if chat_id is not None:
+            forget_active_ui(chat_id, message_id)
     except Exception:
         pass
 
@@ -177,6 +225,7 @@ def remember_ui_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
         return
     context.user_data["ui_message_id"] = message.message_id
     context.user_data["ui_chat_id"] = message.chat_id
+    remember_active_ui(message.chat_id, message.message_id)
 
 
 async def ui_send(
@@ -231,6 +280,7 @@ async def ui_send(
             await context.bot.delete_message(chat_id=ui_chat_id, message_id=ui_message_id)
         except Exception:
             pass
+        forget_active_ui(ui_chat_id, ui_message_id)
 
     sent = await chat.send_message(
         text=text,
@@ -3039,6 +3089,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if mode == 'csv':
         subscriptions_bytes = subscriptions_csv_text(store).encode('utf-8')
         history_bytes = history_csv_text(store).encode('utf-8')
+        await safe_delete_message(update.message)
         await update.message.reply_document(
             document=InputFile(BytesIO(subscriptions_bytes), filename=f'subscriptions_{stamp}.csv'),
             caption='Экспорт подписок в CSV.',
@@ -3052,6 +3103,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     payload = export_user_payload(user.id)
     raw = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    await safe_delete_message(update.message)
     await update.message.reply_document(
         document=InputFile(BytesIO(raw), filename=f'subscription_backup_{stamp}.json'),
         caption='JSON-бэкап готов. Для CSV используй /export csv.',
