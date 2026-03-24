@@ -66,6 +66,7 @@ MONTHLY_SUMMARY_DAY = int(os.getenv("MONTHLY_SUMMARY_DAY", "1"))
 SOON_DAYS = int(os.getenv("SOON_DAYS", "14"))
 BALANCE_WARNING_DAYS = int(os.getenv("BALANCE_WARNING_DAYS", "3"))
 FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "30"))
+YEAR_FORECAST_DAYS = int(os.getenv("YEAR_FORECAST_DAYS", "365"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.getenv("DATA_FILE", os.path.join(BASE_DIR, "subscription_data.json")).strip() or os.path.join(BASE_DIR, "subscription_data.json")
 DEFAULT_REMINDER_OFFSETS = [7, 3, 1, 0]
@@ -78,6 +79,7 @@ MENU = ReplyKeyboardMarkup(
         ["📅 Сегодня", "⏰ Скоро списания"],
         ["🪫 Низкий баланс", "💸 Отметить оплату"],
         ["💼 Сводка", "🔮 Прогноз"],
+        ["🗓 События на год"],
         ["📈 Отчёт", "🧾 История"],
         ["🗃 Архив", "📤 Экспорт"],
         ["❓ Помощь"],
@@ -229,13 +231,14 @@ async def send_add_help(update: Update, key: str) -> None:
     ADD_CONFIRM_EDIT_FIELD,
     PAY_SELECT,
     PAY_AMOUNT,
+    PAY_PERIODS,
     PAY_BALANCE,
     BALANCE_SELECT,
     BALANCE_VALUE,
     EDIT_SELECT,
     EDIT_FIELD,
     EDIT_VALUE,
-) = range(28)
+) = range(29)
 
 
 @dataclass
@@ -682,12 +685,13 @@ def add_years(source: date, years: int) -> date:
     return date(year, source.month, day)
 
 
-def advance_next_charge(subscription: Subscription) -> None:
+def advance_next_charge(subscription: Subscription, periods: int = 1) -> None:
     base = subscription.next_charge_date or today_local()
+    periods = max(1, int(periods or 1))
     if subscription.kind == "monthly":
-        subscription.next_charge_date = add_months(base, 1)
+        subscription.next_charge_date = add_months(base, periods)
     elif subscription.kind == "yearly":
-        subscription.next_charge_date = add_years(base, 1)
+        subscription.next_charge_date = add_years(base, periods)
 
 
 def parse_float(text: str) -> Optional[float]:
@@ -989,25 +993,22 @@ def forecast_regular_charge_items(subscription: Subscription, window_days: int =
 
     start_date = today_local()
     end_date = start_date + timedelta(days=window_days)
-    items: List[dict] = []
     due_date = subscription.next_charge_date
-    loops = 0
-    while due_date is not None and due_date <= end_date and loops < 24:
-        effective_due = start_date if due_date < start_date else due_date
-        items.append({
-            "type": "charge",
-            "subscription_id": subscription.id,
-            "name": subscription.name,
-            "project": subscription.project,
-            "category": subscription.category,
-            "currency": subscription.currency,
-            "amount": subscription.amount,
-            "due_date": effective_due,
-            "note": "Обязательное списание",
-        })
-        due_date = recurring_next_date(subscription, due_date)
-        loops += 1
-    return items
+    effective_due = start_date if due_date < start_date else due_date
+    if effective_due > end_date:
+        return []
+    note = "Ожидает оплаты" if due_date <= start_date else "Ближайшее списание"
+    return [{
+        "type": "charge",
+        "subscription_id": subscription.id,
+        "name": subscription.name,
+        "project": subscription.project,
+        "category": subscription.category,
+        "currency": subscription.currency,
+        "amount": subscription.amount,
+        "due_date": effective_due,
+        "note": note,
+    }]
 
 
 def forecast_balance_topup_items(subscription: Subscription, window_days: int = FORECAST_DAYS) -> List[dict]:
@@ -1115,6 +1116,128 @@ def build_forecast_payload(store: UserStore, window_days: int = FORECAST_DAYS) -
         "by_project": summarize_forecast_by_project(all_items),
         "unmodelled_balance": unmodelled_balance,
     }
+
+
+def format_month_heading(value: date) -> str:
+    month_names = [
+        "январь", "февраль", "март", "апрель", "май", "июнь",
+        "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    ]
+    return f"{month_names[value.month - 1].capitalize()} {value.year}"
+
+
+def months_ahead(count: int = 12) -> List[date]:
+    start = today_local().replace(day=1)
+    return [add_months(start, idx) for idx in range(count)]
+
+
+def build_year_month_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for month_date in months_ahead(12):
+        row.append(InlineKeyboardButton(month_date.strftime('%m.%Y'), callback_data=f"yearmonth:{month_date.strftime('%Y-%m')}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_month_events_lines(store: UserStore, year: int, month: int) -> List[str]:
+    start = date(year, month, 1)
+    end = add_months(start, 1) - timedelta(days=1)
+    payload = build_forecast_payload(store, YEAR_FORECAST_DAYS)
+    regular = [item for item in payload["regular_items"] if start <= item["due_date"] <= end]
+    topups = [item for item in payload["topup_items"] if start <= item["due_date"] <= end]
+    all_items = sorted(regular + topups, key=lambda item: (item["due_date"], item["name"].lower(), item["type"]))
+
+    lines = [
+        f"<b>{format_month_heading(start)}</b>",
+        f"Период: {start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}",
+    ]
+    if not all_items:
+        lines.append("На этот месяц событий пока нет.")
+        return lines
+
+    if regular:
+        lines.append("\n<b>Обязательные списания</b>")
+        for item in regular:
+            lines.append(
+                f"• {item['due_date'].strftime('%d.%m')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
+            )
+    if topups:
+        lines.append("\n<b>Прогнозируемые пополнения</b>")
+        for item in topups:
+            lines.append(
+                f"• {item['due_date'].strftime('%d.%m')} — {escape(item['name'])} — {format_money(float(item['amount']), str(item['currency']))}"
+            )
+    lines.append("\n<b>Итого за месяц</b>")
+    if regular:
+        lines.append(f"• Списания: {format_currency_totals(sum_forecast_items(regular))}")
+    if topups:
+        lines.append(f"• Пополнения: {format_currency_totals(sum_forecast_items(topups))}")
+    lines.append(f"• Всего: {format_currency_totals(sum_forecast_items(all_items))}")
+    return lines
+
+
+def build_year_events_lines(store: UserStore, title: str = "Прогнозируемые события на год", window_days: int = YEAR_FORECAST_DAYS) -> List[str]:
+    payload = build_forecast_payload(store, window_days)
+    start_date = today_local()
+    end_date = start_date + timedelta(days=window_days)
+    lines = [
+        f"<b>{title}</b>",
+        f"Период: {start_date.strftime('%d.%m.%Y')} — {end_date.strftime('%d.%m.%Y')}",
+        f"Всего событий: {len(payload['all_items'])}",
+        f"Обязательные списания: {format_currency_totals(payload['regular_totals'])}",
+        f"Вероятные пополнения: {format_currency_totals(payload['topup_totals'])}",
+        f"Общий прогноз: {format_currency_totals(payload['total_totals'])}",
+    ]
+    if payload['unmodelled_balance']:
+        lines.append(f"Без прогноза по части балансовых сервисов: {payload['unmodelled_balance']}")
+
+    if payload['by_project']:
+        lines.append("\n<b>По проектам</b>")
+        for project, amounts in sorted(payload['by_project'].items()):
+            lines.append(f"• {escape(project)} — {format_currency_totals(amounts)}")
+
+    if not payload['all_items']:
+        lines.append("\nСобытий на выбранный период нет.")
+        return lines
+
+    lines.append("\n<b>Все прогнозируемые события</b>")
+    current_month = None
+    for item in payload['all_items']:
+        due_date = item['due_date']
+        month_key = (due_date.year, due_date.month)
+        if month_key != current_month:
+            current_month = month_key
+            lines.append(f"\n<b>{format_month_heading(due_date)}</b>")
+        icon = "💳" if item['type'] == 'charge' else "🪫"
+        lines.append(
+            f"• {icon} {due_date.strftime('%d.%m.%Y')} — {escape(item['name'])} — "
+            f"{format_money(float(item['amount']), str(item['currency']))}"
+        )
+    return lines
+
+
+async def reply_html_chunks(message, lines: List[str], reply_markup=None) -> None:
+    chunks: List[str] = []
+    current = ""
+    for line in lines:
+        candidate = line if not current else current + "\n" + line
+        if current and len(candidate) > 3900:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for index, chunk in enumerate(chunks):
+        kwargs = {"parse_mode": ParseMode.HTML}
+        if index == 0 and reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        await message.reply_text(chunk, **kwargs)
 
 
 def build_forecast_lines(store: UserStore, title: str = "Прогноз расходов", window_days: int = FORECAST_DAYS) -> List[str]:
@@ -1792,6 +1915,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/edit — изменить подписку\n"
         "/dashboard — расширенная сводка\n"
         "/forecast — прогноз расходов на ближайший период\n"
+        "/year — все прогнозируемые события на год\n"
         "/report — отчёт за текущий месяц\n"
         "/weekly — сводка за 7 дней\n"
         "/monthly — сводка за месяц\n"
@@ -1946,6 +2070,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("pending_subscription", None)
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
+    context.user_data.pop("pending_payment_default", None)
     context.user_data.pop("pending_balance_id", None)
     context.user_data.pop("pending_edit_id", None)
     context.user_data.pop("pending_edit_field", None)
@@ -2857,8 +2982,33 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
-    lines = build_forecast_lines(store, f'Прогноз расходов на {FORECAST_DAYS} дн.', FORECAST_DAYS)
+    lines = build_forecast_lines(store, f'Прогнозируемые события на {FORECAST_DAYS} дн.', FORECAST_DAYS)
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+
+
+async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    await update.message.reply_text(
+        'Выбери месяц. Я покажу прогнозируемые события на него.',
+        reply_markup=build_year_month_keyboard(),
+    )
+
+
+async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.split(':', maxsplit=1)[1]
+    year_str, month_str = raw.split('-', maxsplit=1)
+    year = int(year_str)
+    month = int(month_str)
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    lines = build_month_events_lines(store, year, month)
+    await query.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=build_year_month_keyboard())
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3045,9 +3195,10 @@ async def pay_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text(text + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=MENU)
         return ConversationHandler.END
     context.user_data["pending_payment_id"] = subscription_id
+    context.user_data["pending_payment_default"] = float(subscription.amount)
     await query.message.reply_text(
-        "Введи сумму оплаты или пополнения.",
-        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        f"Укажи сумму оплаты или пополнения. Стандартно: {format_money(float(subscription.amount), subscription.currency)}",
+        reply_markup=ReplyKeyboardMarkup([[str(subscription.amount)], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
     )
     return PAY_AMOUNT
 
@@ -3057,10 +3208,18 @@ async def pay_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not match:
         await update.message.reply_text("Выбери сервис кнопкой из списка.")
         return PAY_SELECT
-    context.user_data["pending_payment_id"] = match.group(1)
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription_id = match.group(1)
+    context.user_data["pending_payment_id"] = subscription_id
+    subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
+    default_amount = float(subscription.amount) if subscription else 0.0
+    context.user_data["pending_payment_default"] = default_amount
+    buttons = [[str(default_amount)], ["/cancel"]] if default_amount else [["/cancel"]]
     await update.message.reply_text(
-        "Введи сумму оплаты или пополнения.",
-        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        "Укажи сумму оплаты или пополнения.",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
     )
     return PAY_AMOUNT
 
@@ -3095,6 +3254,39 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     save_state()
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
+    context.user_data.pop("pending_payment_default", None)
+    await update.message.reply_text(
+        "Оплата сохранена.\n\n" + render_subscription(subscription),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MENU,
+    )
+    return ConversationHandler.END
+
+
+async def pay_periods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    periods = parse_int(update.message.text)
+    if periods is None or periods <= 0:
+        await update.message.reply_text('Введи количество периодов числом: 1, 2, 3...')
+        return PAY_PERIODS
+
+    user = update.effective_user
+    chat = update.effective_chat
+    store = get_store(user.id, chat.id if chat else None)
+    subscription_id = context.user_data.get("pending_payment_id")
+    amount = context.user_data.get("pending_payment_amount")
+    subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
+    if subscription is None:
+        await update.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        return ConversationHandler.END
+
+    record_history(store, subscription, amount, "payment", note=f"Периодов: {periods}")
+    advance_next_charge(subscription, periods)
+    subscription.snoozed_until = None
+    save_state()
+    context.user_data.pop("pending_payment_id", None)
+    context.user_data.pop("pending_payment_amount", None)
+    context.user_data.pop("pending_payment_default", None)
+    context.user_data.pop("pending_payment_default", None)
     await update.message.reply_text(
         "Оплата сохранена.\n\n" + render_subscription(subscription),
         parse_mode=ParseMode.HTML,
@@ -3131,6 +3323,7 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     save_state()
     context.user_data.pop("pending_payment_id", None)
     context.user_data.pop("pending_payment_amount", None)
+    context.user_data.pop("pending_payment_default", None)
     await update.message.reply_text(
         "Пополнение сохранено.\n\n" + render_subscription(subscription),
         parse_mode=ParseMode.HTML,
@@ -3546,6 +3739,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🪫 Низкий баланс": topup_command,
         "💼 Сводка": dashboard_command,
         "🔮 Прогноз": forecast_command,
+        "🗓 События на год": year_command,
         "📈 Отчёт": report_command,
         "🧾 История": history_command,
         "🗃 Архив": archive_command,
@@ -3737,6 +3931,7 @@ def add_handlers(application: Application) -> None:
         states={
             PAY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_select)],
             PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_amount)],
+            PAY_PERIODS: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_periods)],
             PAY_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_balance)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -3787,6 +3982,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("topup", topup_command))
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("forecast", forecast_command))
+    application.add_handler(CommandHandler("year", year_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("weekly", weekly_command))
     application.add_handler(CommandHandler("monthly", monthly_command))
@@ -3798,6 +3994,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("import", import_command))
     application.add_handler(add_conversation)
     application.add_handler(pay_conversation)
+    application.add_handler(CallbackQueryHandler(year_month_callback, pattern=r"^yearmonth:"))
     application.add_handler(balance_conversation)
     application.add_handler(edit_conversation)
     application.add_handler(MessageHandler(filters.Document.ALL, import_document_handler))
