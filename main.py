@@ -48,6 +48,7 @@ LOGGER = logging.getLogger("subscription_bot")
 
 
 ACTIVE_UI_MESSAGES: dict[int, int] = {}
+ACTIVE_PAIRS: dict[int, dict] = {}
 _ORIGINAL_MESSAGE_REPLY_TEXT = Message.reply_text
 
 
@@ -63,27 +64,99 @@ def forget_active_ui(chat_id: int, message_id: int | None = None) -> None:
         ACTIVE_UI_MESSAGES.pop(chat_id, None)
 
 
+def get_pair(chat_id: int) -> dict:
+    return ACTIVE_PAIRS.setdefault(chat_id, {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False})
+
+
+async def delete_current_pair(bot, chat_id: int) -> None:
+    pair = ACTIVE_PAIRS.get(chat_id)
+    if not pair:
+        return
+    if pair.get("sticky"):
+        ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
+        return
+    user_message_id = pair.get("user_message_id")
+    if user_message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=user_message_id)
+        except Exception:
+            pass
+    for message_id in list(pair.get("bot_message_ids", [])):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        forget_active_ui(chat_id, message_id)
+    ACTIVE_PAIRS[chat_id] = {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
+
+
+def should_sticky_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    if message is None:
+        return False
+    text = (message.text or '').strip().lower()
+    if text in {'/import', '/export', '📤 экспорт', 'экспорт'}:
+        return True
+    if message.document is not None:
+        return True
+    if context.user_data.get('awaiting_import'):
+        return True
+    return False
+
+
+async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    pair = get_pair(chat.id)
+    if update.message is not None:
+        action_id = f"m:{update.message.message_id}"
+        if pair.get("action_id") != action_id:
+            await delete_current_pair(context.bot, chat.id)
+            ACTIVE_PAIRS[chat.id] = {
+                "action_id": action_id,
+                "user_message_id": update.message.message_id,
+                "bot_message_ids": [],
+                "sticky": should_sticky_action(update, context),
+            }
+    elif update.callback_query is not None:
+        action_id = f"c:{update.callback_query.id}"
+        if pair.get("action_id") != action_id:
+            await delete_current_pair(context.bot, chat.id)
+            ACTIVE_PAIRS[chat.id] = {
+                "action_id": action_id,
+                "user_message_id": None,
+                "bot_message_ids": [],
+                "sticky": False,
+            }
+
+
+def append_pair_bot_message(chat_id: int, message_id: int) -> None:
+    pair = get_pair(chat_id)
+    ids = pair.setdefault("bot_message_ids", [])
+    if message_id not in ids:
+        ids.append(message_id)
+
+
 async def _compact_reply_text(self: Message, *args, **kwargs):
     chat = self.chat
     if chat is None:
         return await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
 
-    previous_id = ACTIVE_UI_MESSAGES.get(chat.id)
-    if previous_id:
-        try:
-            await self.get_bot().delete_message(chat_id=chat.id, message_id=previous_id)
-        except Exception:
-            pass
-        forget_active_ui(chat.id, previous_id)
+    action_id = f"m:{self.message_id}"
+    pair = get_pair(chat.id)
+    if pair.get("action_id") != action_id:
+        await delete_current_pair(self.get_bot(), chat.id)
+        ACTIVE_PAIRS[chat.id] = {
+            "action_id": action_id,
+            "user_message_id": self.message_id,
+            "bot_message_ids": [],
+            "sticky": False,
+        }
 
     sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
+    append_pair_bot_message(chat.id, sent.message_id)
     remember_active_ui(chat.id, sent.message_id)
-
-    if chat.type == 'private':
-        try:
-            await self.delete()
-        except Exception:
-            pass
     return sent
 
 
@@ -226,6 +299,7 @@ def remember_ui_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
     context.user_data["ui_message_id"] = message.message_id
     context.user_data["ui_chat_id"] = message.chat_id
     remember_active_ui(message.chat_id, message.message_id)
+    append_pair_bot_message(message.chat_id, message.message_id)
 
 
 async def ui_send(
@@ -241,7 +315,20 @@ async def ui_send(
     if chat is None:
         return
 
+    await start_new_action(update, context)
     uses_reply_keyboard = isinstance(reply_markup, ReplyKeyboardMarkup) or reply_markup is MENU
+
+    if force_new:
+        ui_chat_id = context.user_data.get("ui_chat_id")
+        ui_message_id = context.user_data.get("ui_message_id")
+        if ui_chat_id == chat.id and ui_message_id:
+            try:
+                await context.bot.delete_message(chat_id=ui_chat_id, message_id=ui_message_id)
+            except Exception:
+                pass
+            forget_active_ui(ui_chat_id, ui_message_id)
+            context.user_data.pop("ui_chat_id", None)
+            context.user_data.pop("ui_message_id", None)
 
     query = update.callback_query
     if query is not None and query.message is not None and not force_new and not uses_reply_keyboard:
@@ -269,18 +356,18 @@ async def ui_send(
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
-            if update.message is not None and chat.type == "private":
-                await safe_delete_message(update.message)
             return
         except Exception:
             pass
 
-    if ui_chat_id == chat.id and ui_message_id:
+    if ui_chat_id == chat.id and ui_message_id and uses_reply_keyboard:
         try:
             await context.bot.delete_message(chat_id=ui_chat_id, message_id=ui_message_id)
         except Exception:
             pass
         forget_active_ui(ui_chat_id, ui_message_id)
+        context.user_data.pop("ui_chat_id", None)
+        context.user_data.pop("ui_message_id", None)
 
     sent = await chat.send_message(
         text=text,
@@ -289,9 +376,6 @@ async def ui_send(
         disable_web_page_preview=True,
     )
     remember_ui_message(context, sent)
-    if update.message is not None and chat.type == "private":
-        await safe_delete_message(update.message)
-
 
 def keyboard_with_help(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     normalized = [row[:] for row in rows]
@@ -3089,7 +3173,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if mode == 'csv':
         subscriptions_bytes = subscriptions_csv_text(store).encode('utf-8')
         history_bytes = history_csv_text(store).encode('utf-8')
-        await safe_delete_message(update.message)
         await update.message.reply_document(
             document=InputFile(BytesIO(subscriptions_bytes), filename=f'subscriptions_{stamp}.csv'),
             caption='Экспорт подписок в CSV.',
@@ -3103,7 +3186,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     payload = export_user_payload(user.id)
     raw = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
-    await safe_delete_message(update.message)
     await update.message.reply_document(
         document=InputFile(BytesIO(raw), filename=f'subscription_backup_{stamp}.json'),
         caption='JSON-бэкап готов. Для CSV используй /export csv.',
@@ -3115,8 +3197,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_authorized(update):
         return
     context.user_data['awaiting_import'] = True
-    await update.message.reply_text(
-        'Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text='Пришли JSON-бэкап или CSV-файл с экспортом подписок. JSON восстановит подписки, архив и историю. CSV импортирует только подписки.',
         reply_markup=MENU,
     )
 
@@ -3143,22 +3226,24 @@ async def import_document_handler(update: Update, context: ContextTypes.DEFAULT_
         if filename.endswith('.json'):
             payload = json.loads(raw.decode('utf-8'))
             active_count, archived_count, history_count = apply_import_payload(user.id, payload, chat.id if chat else None)
-            await message.reply_text(
-                f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                text=f'Импорт JSON завершён. Активных: {active_count}, в архиве: {archived_count}, операций истории: {history_count}.',
                 reply_markup=MENU,
             )
         elif filename.endswith('.csv'):
             imported_active, imported_archived = apply_import_csv(user.id, raw.decode('utf-8'), chat.id if chat else None)
-            await message.reply_text(
-                f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                text=f'Импорт CSV завершён. Активных: {imported_active}, архивных: {imported_archived}. История не менялась.',
                 reply_markup=MENU,
             )
         else:
-            await message.reply_text('Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
+            await context.bot.send_message(chat_id=message.chat_id, text='Поддерживаются только файлы .json и .csv.', reply_markup=MENU)
             return
     except Exception as exc:
         LOGGER.exception('Import failed: %s', exc)
-        await message.reply_text(f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
+        await context.bot.send_message(chat_id=message.chat_id, text=f'Не удалось импортировать файл: {escape(str(exc))}', parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
     finally:
         context.user_data['awaiting_import'] = False
