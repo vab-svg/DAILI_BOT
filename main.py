@@ -163,6 +163,84 @@ CURRENCY_KEYBOARD = ReplyKeyboardMarkup(
 HELP_BUTTON = "❓ Помощь"
 
 
+async def safe_delete_message(message) -> None:
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+def remember_ui_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    if message is None:
+        return
+    context.user_data["ui_message_id"] = message.message_id
+    context.user_data["ui_chat_id"] = message.chat_id
+
+
+async def ui_send(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_markup=None,
+    parse_mode=None,
+    force_new: bool = False,
+) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    query = update.callback_query
+    if query is not None and query.message is not None and not force_new:
+        try:
+            sent = await query.message.edit_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+            remember_ui_message(context, sent)
+            return
+        except Exception:
+            pass
+
+    ui_chat_id = context.user_data.get("ui_chat_id")
+    ui_message_id = context.user_data.get("ui_message_id")
+    if ui_chat_id == chat.id and ui_message_id and not force_new:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=ui_chat_id,
+                message_id=ui_message_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+            if update.message is not None and chat.type == "private":
+                await safe_delete_message(update.message)
+            return
+        except Exception:
+            pass
+
+    if ui_chat_id == chat.id and ui_message_id and force_new:
+        try:
+            await context.bot.delete_message(chat_id=ui_chat_id, message_id=ui_message_id)
+        except Exception:
+            pass
+
+    sent = await chat.send_message(
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        disable_web_page_preview=True,
+    )
+    remember_ui_message(context, sent)
+    if update.message is not None and chat.type == "private":
+        await safe_delete_message(update.message)
+
+
 def keyboard_with_help(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     normalized = [row[:] for row in rows]
     if not normalized or normalized[-1] != [HELP_BUTTON, "/cancel"]:
@@ -205,8 +283,8 @@ ADD_HELP_TEXT = {
 
 
 
-async def send_add_help(update: Update, key: str) -> None:
-    await update.message.reply_text(ADD_HELP_TEXT[key])
+async def send_add_help(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    await ui_send(update, context, ADD_HELP_TEXT[key])
 
 (
     ADD_NAME,
@@ -1861,7 +1939,7 @@ async def ensure_owner_access(update: Update) -> bool:
     if OWNER_USER_ID is not None and user.id != OWNER_USER_ID:
         text = 'Эта команда доступна только владельцу бота.'
         if update.message:
-            await update.message.reply_text(text, reply_markup=MENU)
+            await ui_send(update, context, text, reply_markup=MENU, force_new=True)
         elif update.callback_query:
             await update.callback_query.answer(text, show_alert=True)
         return False
@@ -1896,7 +1974,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if not store.subscriptions:
         message += "\n\nДля быстрого теста можешь запустить /demo."
-    await update.message.reply_text(message, reply_markup=MENU)
+    await ui_send(update, context, message, reply_markup=MENU, force_new=True)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1929,7 +2007,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/demo — добавить демо-набор подписок\n"
         "/cancel — отменить текущий диалог"
     )
-    await update.message.reply_text(text, reply_markup=MENU)
+    await ui_send(update, context, text, reply_markup=MENU, force_new=True)
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2203,11 +2281,7 @@ async def maybe_return_to_confirmation(update: Update, context: ContextTypes.DEF
 
 async def ask_add_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pending = context.user_data.get("pending_subscription", {})
-    await update.message.reply_text(
-        pending_subscription_preview(pending),
-        parse_mode=ParseMode.HTML,
-        reply_markup=confirm_keyboard(),
-    )
+    await ui_send(update, context, pending_subscription_preview(pending), parse_mode=ParseMode.HTML, reply_markup=confirm_keyboard())
     return ADD_CONFIRM
 
 
@@ -2215,133 +2289,118 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await ensure_authorized(update):
         return ConversationHandler.END
     context.user_data["pending_subscription"] = {}
-    await update.message.reply_text(
-        "Введи название сервиса.\nНапример: OpenAI или Hetzner VPS",
+    await ui_send(
+        update,
+        context,
+        "Шаг 1\nНазвание сервиса:",
         reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+        force_new=True,
     )
     return ADD_NAME
 
 
 async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "name")
+        await send_add_help(update, context, "name")
         return ADD_NAME
     name = update.message.text.strip()
     if len(name) < 2:
-        await update.message.reply_text("Название слишком короткое. Попробуй ещё раз.")
+        await ui_send(update, context, "Название слишком короткое. Попробуй ещё раз.")
         return ADD_NAME
     context.user_data["pending_subscription"]["name"] = name
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(step_text(2, 10, "Тип сервиса"), reply_markup=keyboard_with_help([["📅 Ежемесячная", "🗓 Годовая"], ["💳 С балансом"]]))
+    await ui_send(update, context, step_text(2, 10, "Тип сервиса"), reply_markup=keyboard_with_help([["📅 Ежемесячная", "🗓 Годовая"], ["💳 С балансом"]]))
     return ADD_KIND
 
 
 async def add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "kind")
+        await send_add_help(update, context, "kind")
         return ADD_KIND
     kind = get_kind_from_label(update.message.text)
     if kind is None:
-        await update.message.reply_text("Выбери тип кнопкой ниже.", reply_markup=KIND_KEYBOARD)
+        await ui_send(update, context, "Выбери тип кнопкой ниже.", reply_markup=KIND_KEYBOARD)
         return ADD_KIND
     context.user_data["pending_subscription"]["kind"] = kind
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
     prompt = "Сумма подписки" if kind != "balance" else "Обычная сумма пополнения"
-    await update.message.reply_text(
-        step_text(3, 10, prompt),
-        reply_markup=keyboard_with_help([]),
-    )
+    await ui_send(update, context, step_text(3, 10, prompt), reply_markup=keyboard_with_help([]))
     return ADD_AMOUNT
 
 
 async def add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "amount")
+        await send_add_help(update, context, "amount")
         return ADD_AMOUNT
     amount = parse_float(update.message.text)
     if amount is None:
-        await update.message.reply_text("Нужна положительная сумма. Например: 15.5")
+        await ui_send(update, context, "Нужна положительная сумма.")
         return ADD_AMOUNT
     context.user_data["pending_subscription"]["amount"] = amount
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(4, 10, "Валюта"),
-        reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]),
-    )
+    await ui_send(update, context, step_text(4, 10, "Валюта"), reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]))
     return ADD_CURRENCY
 
 
 async def add_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "currency")
+        await send_add_help(update, context, "currency")
         return ADD_CURRENCY
     currency = parse_currency_input(update.message.text)
     if currency is None:
-        await update.message.reply_text(
-            step_text(4, 10, "Валюта"),
-            reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]),
-        )
+        await ui_send(update, context, step_text(4, 10, "Валюта"), reply_markup=keyboard_with_help([["₸ Тенге", "₽ Рубли", "€ Евро"], ["$ Доллары", "₺ Лиры"]]))
         return ADD_CURRENCY
     context.user_data["pending_subscription"]["currency"] = currency
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(5, 10, "Проект или группа"),
-        reply_markup=keyboard_with_help([["Все проекты", "Личное"]]),
-    )
+    await ui_send(update, context, step_text(5, 10, "Проект или группа"), reply_markup=keyboard_with_help([["Все проекты", "Личное"]]))
     return ADD_PROJECT
 
 
 async def add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "project")
+        await send_add_help(update, context, "project")
         return ADD_PROJECT
     project = update.message.text.strip()
     if len(project) < 1:
-        await update.message.reply_text("Проект не должен быть пустым.")
+        await ui_send(update, context, "Проект не должен быть пустым.")
         return ADD_PROJECT
     pending = context.user_data["pending_subscription"]
     pending["project"] = project
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(6, 10, "Категория", "Можно выбрать кнопку или ввести свою"),
-        reply_markup=keyboard_with_help([["Инфраструктура", "Связь"], ["AI/API", "Домены"], ["Маркетинг", "Личное"], ["Прочее"]]),
-    )
+    await ui_send(update, context, step_text(6, 10, "Категория", "Можно выбрать кнопку или ввести свою"), reply_markup=keyboard_with_help([["Инфраструктура", "Связь"], ["AI/API", "Домены"], ["Маркетинг", "Личное"], ["Прочее"]]))
     return ADD_CATEGORY
 
 
 async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "category")
+        await send_add_help(update, context, "category")
         return ADD_CATEGORY
     category = update.message.text.strip()
     if len(category) < 1:
-        await update.message.reply_text("Категория не должна быть пустой.", reply_markup=CATEGORY_KEYBOARD)
+        await ui_send(update, context, "Категория не должна быть пустой.", reply_markup=CATEGORY_KEYBOARD)
         return ADD_CATEGORY
     pending = context.user_data["pending_subscription"]
     pending["category"] = category
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(7, 10, "Теги", "Через запятую или -"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(7, 10, "Теги", "Через запятую или -"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_TAGS
 
 
 async def add_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "tags")
+        await send_add_help(update, context, "tags")
         return ADD_TAGS
     pending = context.user_data["pending_subscription"]
     pending["tags"] = parse_tags_input(update.message.text)
@@ -2349,82 +2408,67 @@ async def add_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if maybe_state is not None:
         return maybe_state
     if pending["kind"] == "balance":
-        await update.message.reply_text(
-            step_text(8, 10, "Текущий баланс"),
-            reply_markup=keyboard_with_help([]),
-        )
+        await ui_send(update, context, step_text(8, 10, "Текущий баланс"), reply_markup=keyboard_with_help([]))
         return ADD_CURRENT_BALANCE
-    await update.message.reply_text(
-        step_text(8, 10, "Дата следующего списания", "ДД.ММ.ГГГГ или ГГГГ-ММ-ДД"),
-        reply_markup=keyboard_with_help([]),
-    )
+    await ui_send(update, context, step_text(8, 10, "Дата следующего списания", "ДД.ММ.ГГГГ или ГГГГ-ММ-ДД"), reply_markup=keyboard_with_help([]))
     return ADD_NEXT_DATE
 
 
 async def add_next_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "next_date")
+        await send_add_help(update, context, "next_date")
         return ADD_NEXT_DATE
     value = parse_date_input(update.message.text)
     if value is None:
-        await update.message.reply_text("Не смог распознать дату. Пример: 28.03.2026")
+        await ui_send(update, context, "Не смог распознать дату. Попробуй ещё раз.")
         return ADD_NEXT_DATE
     context.user_data["pending_subscription"]["next_charge_date"] = value
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(9, 10, "Когда напомнить", "Например: 7,3,1,0"),
-        reply_markup=keyboard_with_help([["7,3,1,0"], ["3,1,0"]]),
-    )
+    await ui_send(update, context, step_text(9, 10, "Когда напомнить", "7,3,1,0"), reply_markup=keyboard_with_help([["7,3,1,0"], ["3,1,0"]]))
     return ADD_REMIND_DAYS
 
 
 async def add_remind_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "reminders")
+        await send_add_help(update, context, "reminders")
         return ADD_REMIND_DAYS
     offsets = parse_reminder_offsets(update.message.text)
     if offsets is None:
-        await update.message.reply_text("Введи список дней через запятую. Например: 7,3,1,0")
+        await ui_send(update, context, "Введи дни через запятую. Например: 7,3,1,0")
         return ADD_REMIND_DAYS
     context.user_data["pending_subscription"]["reminder_offsets"] = offsets
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(10, 10, "Повторять после даты списания", "Да — напоминать каждый день"),
-        reply_markup=keyboard_with_help([["Да", "Нет"]]),
-    )
+    await ui_send(update, context, step_text(10, 10, "Повторять после даты списания", "Да — напоминать каждый день"), reply_markup=keyboard_with_help([["Да", "Нет"]]))
     return ADD_REPEAT_UNTIL_PAID
 
 
 async def add_repeat_until_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "repeat")
+        await send_add_help(update, context, "repeat")
         return ADD_REPEAT_UNTIL_PAID
     repeat = parse_yes_no(update.message.text)
     if repeat is None:
-        await update.message.reply_text("Ответь Да или Нет.", reply_markup=YES_NO_KEYBOARD)
+        await ui_send(update, context, "Ответь Да или Нет.", reply_markup=YES_NO_KEYBOARD)
         return ADD_REPEAT_UNTIL_PAID
     context.user_data["pending_subscription"]["repeat_daily_until_paid"] = repeat
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_NOTES
 
 
 async def add_current_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "balance")
+        await send_add_help(update, context, "balance")
         return ADD_CURRENT_BALANCE
     balance = parse_float(update.message.text)
     if balance is None:
-        await update.message.reply_text("Введи корректное число. Например: 12.5")
+        await ui_send(update, context, "Введи корректное число.")
         return ADD_CURRENT_BALANCE
     pending = context.user_data["pending_subscription"]
     pending["current_balance"] = balance
@@ -2432,42 +2476,33 @@ async def add_current_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(9, 12, "Минимальный порог", "Когда баланс дойдёт до порога, бот напомнит"),
-        reply_markup=keyboard_with_help([["10"]]),
-    )
+    await ui_send(update, context, step_text(9, 12, "Минимальный порог", "Когда баланс дойдёт до порога, бот напомнит"), reply_markup=keyboard_with_help([["10"]]))
     return ADD_MIN_BALANCE
 
 
 async def add_min_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "min_balance")
+        await send_add_help(update, context, "min_balance")
         return ADD_MIN_BALANCE
     minimum = parse_float(update.message.text)
     if minimum is None:
-        await update.message.reply_text("Введи корректное число. Например: 10")
+        await ui_send(update, context, "Введи корректное число.")
         return ADD_MIN_BALANCE
     context.user_data["pending_subscription"]["min_balance"] = minimum
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(10, 12, "Как считать расход", "Выбери самый удобный вариант"),
-        reply_markup=keyboard_with_help([["🖐 Ручной контроль"], ["📆 Списание по расписанию"], ["📉 Расход в день"]]),
-    )
+    await ui_send(update, context, step_text(10, 12, "Как считать расход", "Выбери самый удобный вариант"), reply_markup=keyboard_with_help([["🖐 Ручной контроль"], ["📆 Списание по расписанию"], ["📉 Расход в день"]]))
     return ADD_BALANCE_MODE
 
 
 async def add_balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "balance_mode")
+        await send_add_help(update, context, "balance_mode")
         return ADD_BALANCE_MODE
     mode = get_balance_mode_from_label(update.message.text)
     if mode is None:
-        await update.message.reply_text(
-            "Выбери один из вариантов.",
-            reply_markup=keyboard_with_help([["🖐 Ручной контроль"], ["📆 Списание по расписанию"], ["📉 Расход в день"]]),
-        )
+        await ui_send(update, context, "Выбери один из вариантов.", reply_markup=keyboard_with_help([["🖐 Ручной контроль"], ["📆 Списание по расписанию"], ["📉 Расход в день"]]))
         return ADD_BALANCE_MODE
 
     pending = context.user_data["pending_subscription"]
@@ -2477,33 +2512,24 @@ async def add_balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return maybe_state
 
     if mode == "manual":
-        await update.message.reply_text(
-            step_text(13, 13, "Заметка", "- чтобы пропустить"),
-            reply_markup=keyboard_with_help([["-"]]),
-        )
+        await ui_send(update, context, step_text(13, 13, "Заметка", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
         return ADD_NOTES
 
     if mode == "fixed":
-        await update.message.reply_text(
-            step_text(11, 13, "Сумма списания"),
-            reply_markup=keyboard_with_help([]),
-        )
+        await ui_send(update, context, step_text(11, 13, "Сумма списания"), reply_markup=keyboard_with_help([]))
         return ADD_SPEND_AMOUNT
 
-    await update.message.reply_text(
-        step_text(11, 13, "Расход в день"),
-        reply_markup=keyboard_with_help([]),
-    )
+    await ui_send(update, context, step_text(11, 13, "Расход в день"), reply_markup=keyboard_with_help([]))
     return ADD_SPEND_AMOUNT
 
 
 async def add_spend_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "spend_amount")
+        await send_add_help(update, context, "spend_amount")
         return ADD_SPEND_AMOUNT
     value = parse_float(update.message.text)
     if value is None:
-        await update.message.reply_text("Введи корректную сумму. Например: 20")
+        await ui_send(update, context, "Введи корректную сумму.")
         return ADD_SPEND_AMOUNT
 
     pending = context.user_data["pending_subscription"]
@@ -2520,76 +2546,64 @@ async def add_spend_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ADD_SPEND_PERIOD
 
     pending["spend_period_days"] = 1
-    await update.message.reply_text(
-        step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_NOTES
 
 
 async def add_spend_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "spend_period")
+        await send_add_help(update, context, "spend_period")
         return ADD_SPEND_PERIOD
     value = parse_int(update.message.text)
     if value is None or value <= 0:
-        await update.message.reply_text("Введи положительное число дней. Например: 30")
+        await ui_send(update, context, "Введи положительное число дней.")
         return ADD_SPEND_PERIOD
     context.user_data["pending_subscription"]["spend_period_days"] = value
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(pending_total_steps(context.user_data["pending_subscription"]) - 2, pending_total_steps(context.user_data["pending_subscription"]), "Заметка", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_NOTES
 
 
 async def add_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "notes")
+        await send_add_help(update, context, "notes")
         return ADD_NOTES
     pending = context.user_data["pending_subscription"]
     pending["notes"] = "" if update.message.text.strip() == "-" else update.message.text.strip()
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
-    await update.message.reply_text(
-        step_text(pending_total_steps(pending) - 1, pending_total_steps(pending), "Ссылка на сайт", "- чтобы пропустить"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(pending_total_steps(pending) - 1, pending_total_steps(pending), "Ссылка на сайт", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_SITE_URL
 
 
 async def add_site_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "site_url")
+        await send_add_help(update, context, "site_url")
         return ADD_SITE_URL
     try:
         context.user_data["pending_subscription"]["site_url"] = clean_optional_url(update.message.text)
     except ValueError as exc:
-        await update.message.reply_text(str(exc), reply_markup=YES_SKIP_KEYBOARD)
+        await ui_send(update, context, str(exc), reply_markup=YES_SKIP_KEYBOARD)
         return ADD_SITE_URL
     maybe_state = await maybe_return_to_confirmation(update, context)
     if maybe_state is not None:
         return maybe_state
     pending = context.user_data["pending_subscription"]
-    await update.message.reply_text(
-        step_text(pending_total_steps(pending), pending_total_steps(pending), "Ссылка на оплату", "- чтобы пропустить"),
-        reply_markup=keyboard_with_help([["-"]]),
-    )
+    await ui_send(update, context, step_text(pending_total_steps(pending), pending_total_steps(pending), "Ссылка на оплату", "- чтобы пропустить"), reply_markup=keyboard_with_help([["-"]]))
     return ADD_PAYMENT_URL
 
 
 async def add_payment_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if is_help_request(update.message.text):
-        await send_add_help(update, "payment_url")
+        await send_add_help(update, context, "payment_url")
         return ADD_PAYMENT_URL
     try:
         payment_url = clean_optional_url(update.message.text)
     except ValueError as exc:
-        await update.message.reply_text(str(exc), reply_markup=YES_SKIP_KEYBOARD)
+        await ui_send(update, context, str(exc), reply_markup=YES_SKIP_KEYBOARD)
         return ADD_PAYMENT_URL
 
     pending = context.user_data.get("pending_subscription", {})
@@ -2603,7 +2617,7 @@ async def add_payment_url(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if is_help_request(text):
-        await send_add_help(update, "confirm")
+        await send_add_help(update, context, "confirm")
         return ADD_CONFIRM
 
     if text == CONFIRM_SAVE:
@@ -2646,15 +2660,15 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if text == CONFIRM_EDIT:
         pending = context.user_data.get("pending_subscription", {})
-        await update.message.reply_text("Что хочешь поправить?", reply_markup=confirm_edit_keyboard(pending))
+        await ui_send(update, context, "Что хочешь поправить?", reply_markup=confirm_edit_keyboard(pending))
         return ADD_CONFIRM_EDIT_FIELD
 
     if text == CONFIRM_CANCEL:
         context.user_data.pop("pending_subscription", None)
-        await update.message.reply_text("Ок, не сохраняю эту подписку.", reply_markup=MENU)
+        await ui_send(update, context, "Ок, не сохраняю эту подписку.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
-    await update.message.reply_text("Выбери: сохранить, изменить или отменить.", reply_markup=confirm_keyboard())
+    await ui_send(update, context, "Выбери: сохранить, изменить или отменить.", reply_markup=confirm_keyboard())
     return ADD_CONFIRM
 
 
@@ -2663,13 +2677,13 @@ async def add_confirm_edit_field(update: Update, context: ContextTypes.DEFAULT_T
     if choice == "⬅️ Назад":
         return await ask_add_confirmation(update, context)
     if is_help_request(choice):
-        await send_add_help(update, "confirm")
+        await send_add_help(update, context, "confirm")
         return ADD_CONFIRM_EDIT_FIELD
 
     pending = context.user_data.get("pending_subscription", {})
     field, state, title, hint = map_confirm_field(choice, pending)
     if state is None:
-        await update.message.reply_text("Выбери поле кнопкой ниже.", reply_markup=confirm_edit_keyboard(pending))
+        await ui_send(update, context, "Выбери поле кнопкой ниже.", reply_markup=confirm_edit_keyboard(pending))
         return ADD_CONFIRM_EDIT_FIELD
 
     keyboard = keyboard_with_help([])
@@ -2693,7 +2707,7 @@ async def add_confirm_edit_field(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = keyboard_with_help([["7", "30"]])
 
     context.user_data["confirm_edit_mode"] = True
-    await update.message.reply_text(step_text(1, 1, title.rstrip(':'), hint), reply_markup=keyboard)
+    await ui_send(update, context, step_text(1, 1, title.rstrip(':'), hint), reply_markup=keyboard)
     return state
 
 
@@ -2704,7 +2718,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     if not store.subscriptions:
-        await update.message.reply_text("Пока пусто. Нажми «➕ Добавить», чтобы создать первую подписку.", reply_markup=MENU)
+        await ui_send(update, context, "Пока пусто. Нажми «➕ Добавить», чтобы создать первую подписку.", reply_markup=MENU, force_new=True)
         return
 
     active = [sub for sub in store.subscriptions.values() if sub.active]
@@ -2989,10 +3003,7 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
-    await update.message.reply_text(
-        'Выбери месяц. Я покажу прогнозируемые события на него.',
-        reply_markup=build_year_month_keyboard(),
-    )
+    await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard(), force_new=True)
 
 
 async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3169,10 +3180,7 @@ async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     buttons = [[f"{subscription.name} [{subscription.id}]"] for subscription in subscriptions]
     buttons.append(["/cancel"])
-    await update.message.reply_text(
-        "Выбери сервис для фиксации оплаты или пополнения:",
-        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, "Выбери сервис для фиксации оплаты или пополнения:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), force_new=True)
     return PAY_SELECT
 
 
@@ -3187,26 +3195,23 @@ async def pay_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     store = get_store(user.id, chat.id if chat else None)
     subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
     if subscription is None:
-        await query.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        await ui_send(update, context, "Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
     if action == "paydefault":
         apply_default_payment(store, subscription)
         text = "Пополнение сохранено.\n\n" if subscription.kind == "balance" else "Оплата сохранена.\n\n"
-        await query.message.reply_text(text + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=MENU)
+        await ui_send(update, context, text + render_subscription(subscription), parse_mode=ParseMode.HTML, reply_markup=MENU, force_new=True)
         return ConversationHandler.END
     context.user_data["pending_payment_id"] = subscription_id
     context.user_data["pending_payment_default"] = float(subscription.amount)
-    await query.message.reply_text(
-        f"Укажи сумму оплаты или пополнения. Стандартно: {format_money(float(subscription.amount), subscription.currency)}",
-        reply_markup=ReplyKeyboardMarkup([[str(subscription.amount)], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, f"Укажи сумму оплаты или пополнения. Стандартно: {format_money(float(subscription.amount), subscription.currency)}", reply_markup=ReplyKeyboardMarkup([[str(subscription.amount)], ["/cancel"]], resize_keyboard=True, one_time_keyboard=True))
     return PAY_AMOUNT
 
 
 async def pay_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     match = re.search(r"\[([0-9a-f]{8})\]$", update.message.text.strip())
     if not match:
-        await update.message.reply_text("Выбери сервис кнопкой из списка.")
+        await ui_send(update, context, "Выбери сервис кнопкой из списка.")
         return PAY_SELECT
     user = update.effective_user
     chat = update.effective_chat
@@ -3217,17 +3222,14 @@ async def pay_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     default_amount = float(subscription.amount) if subscription else 0.0
     context.user_data["pending_payment_default"] = default_amount
     buttons = [[str(default_amount)], ["/cancel"]] if default_amount else [["/cancel"]]
-    await update.message.reply_text(
-        "Укажи сумму оплаты или пополнения.",
-        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, "Укажи сумму оплаты или пополнения.", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True))
     return PAY_AMOUNT
 
 
 async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     amount = parse_float(update.message.text)
     if amount is None:
-        await update.message.reply_text("Введи корректную сумму. Например: 25")
+        await ui_send(update, context, "Введи корректную сумму.")
         return PAY_AMOUNT
 
     user = update.effective_user
@@ -3236,7 +3238,7 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     subscription_id = context.user_data.get("pending_payment_id")
     subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
     if subscription is None:
-        await update.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        await ui_send(update, context, "Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     context.user_data["pending_payment_amount"] = amount
@@ -3266,7 +3268,7 @@ async def pay_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def pay_periods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     periods = parse_int(update.message.text)
     if periods is None or periods <= 0:
-        await update.message.reply_text('Введи количество периодов числом: 1, 2, 3...')
+        await ui_send(update, context, 'Введи количество периодов числом: 1, 2, 3...')
         return PAY_PERIODS
 
     user = update.effective_user
@@ -3276,7 +3278,7 @@ async def pay_periods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     amount = context.user_data.get("pending_payment_amount")
     subscription = store.subscriptions.get(subscription_id) or store.archived_subscriptions.get(subscription_id)
     if subscription is None:
-        await update.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        await ui_send(update, context, "Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     record_history(store, subscription, amount, "payment", note=f"Периодов: {periods}")
@@ -3303,7 +3305,7 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     amount = context.user_data.get("pending_payment_amount")
     subscription = store.subscriptions.get(subscription_id)
     if subscription is None:
-        await update.message.reply_text("Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU)
+        await ui_send(update, context, "Не нашёл сервис. Попробуй ещё раз через /pay.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     raw = update.message.text.strip()
@@ -3313,7 +3315,7 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     else:
         new_balance = parse_float(raw)
         if new_balance is None:
-            await update.message.reply_text("Введи число или '-'.")
+            await ui_send(update, context, "Введи число или '-'.")
             return PAY_BALANCE
         subscription.current_balance = new_balance
 
@@ -3340,17 +3342,12 @@ async def set_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     store = get_store(user.id, chat.id if chat else None)
     subscriptions = [sub for sub in balance_subscriptions(store) if sub.active]
     if not subscriptions:
-        await update.message.reply_text(
-            "Нет активных балансовых сервисов.", reply_markup=MENU
-        )
+        await ui_send(update, context, "Нет активных балансовых сервисов.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     buttons = [[f"{subscription.name} [{subscription.id}]"] for subscription in subscriptions]
     buttons.append(["/cancel"])
-    await update.message.reply_text(
-        "Выбери сервис, у которого нужно обновить баланс:",
-        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, "Выбери сервис, у которого нужно обновить баланс:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True))
     return BALANCE_SELECT
 
 
@@ -3361,30 +3358,24 @@ async def set_balance_from_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     subscription_id = query.data.split(":", maxsplit=1)[1]
     context.user_data["pending_balance_id"] = subscription_id
-    await query.message.reply_text(
-        "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.",
-        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.", reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True))
     return BALANCE_VALUE
 
 
 async def set_balance_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     match = re.search(r"\[([0-9a-f]{8})\]$", update.message.text.strip())
     if not match:
-        await update.message.reply_text("Выбери сервис кнопкой из списка.")
+        await ui_send(update, context, "Выбери сервис кнопкой из списка.")
         return BALANCE_SELECT
     context.user_data["pending_balance_id"] = match.group(1)
-    await update.message.reply_text(
-        "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.",
-        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
-    )
+    await ui_send(update, context, "Введи новый текущий баланс. Я сохраню его как новую точку отсчёта на сегодня.", reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True))
     return BALANCE_VALUE
 
 
 async def set_balance_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     value = parse_float(update.message.text)
     if value is None:
-        await update.message.reply_text("Введи корректное число. Например: 6.5")
+        await ui_send(update, context, "Введи корректное число.")
         return BALANCE_VALUE
 
     user = update.effective_user
@@ -3393,7 +3384,7 @@ async def set_balance_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     subscription_id = context.user_data.get("pending_balance_id")
     subscription = store.subscriptions.get(subscription_id)
     if subscription is None:
-        await update.message.reply_text("Сервис не найден.", reply_markup=MENU)
+        await ui_send(update, context, "Сервис не найден.", reply_markup=MENU, force_new=True)
         return ConversationHandler.END
 
     subscription.current_balance = value
