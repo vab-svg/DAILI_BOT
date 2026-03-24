@@ -48,9 +48,17 @@ LOGGER = logging.getLogger("subscription_bot")
 
 
 ACTIVE_UI_MESSAGES: dict[int, int] = {}
-CURRENT_PAIRS: dict[int, dict] = {}
-PREVIOUS_PAIRS: dict[int, dict] = {}
+TRACK_STATE: dict[int, dict] = {}
 _ORIGINAL_MESSAGE_REPLY_TEXT = Message.reply_text
+
+
+def _track(chat_id: int) -> dict:
+    return TRACK_STATE.setdefault(chat_id, {
+        "current_user": None,
+        "previous_user": None,
+        "current_bot": [],
+        "previous_bot": [],
+    })
 
 
 def remember_active_ui(chat_id: int, message_id: int) -> None:
@@ -65,55 +73,23 @@ def forget_active_ui(chat_id: int, message_id: int | None = None) -> None:
         ACTIVE_UI_MESSAGES.pop(chat_id, None)
 
 
-def _empty_pair() -> dict:
-    return {"action_id": None, "user_message_id": None, "bot_message_ids": [], "sticky": False}
-
-
-def get_current_pair(chat_id: int) -> dict:
-    return CURRENT_PAIRS.setdefault(chat_id, _empty_pair())
-
-
-def _pair_clone(pair: dict | None) -> dict:
-    if not pair:
-        return _empty_pair()
-    return {
-        "action_id": pair.get("action_id"),
-        "user_message_id": pair.get("user_message_id"),
-        "bot_message_ids": list(pair.get("bot_message_ids", [])),
-        "sticky": bool(pair.get("sticky", False)),
-    }
-
-
-async def _delete_pair(bot, chat_id: int, pair: dict | None) -> None:
-    if not pair or pair.get("sticky"):
+async def _safe_delete_by_id(bot, chat_id: int, message_id: int | None) -> None:
+    if not message_id:
         return
-    user_message_id = pair.get("user_message_id")
-    if user_message_id:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=user_message_id)
-        except Exception:
-            pass
-    for message_id in list(pair.get("bot_message_ids", [])):
-        if not message_id:
-            continue
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception:
-            pass
-        forget_active_ui(chat_id, message_id)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+    forget_active_ui(chat_id, message_id)
 
 
-async def delete_current_pair(bot, chat_id: int) -> None:
-    await _delete_pair(bot, chat_id, CURRENT_PAIRS.get(chat_id))
-    CURRENT_PAIRS[chat_id] = _empty_pair()
-
-
-async def delete_previous_pair(bot, chat_id: int) -> None:
-    await _delete_pair(bot, chat_id, PREVIOUS_PAIRS.pop(chat_id, None))
-
-
-def should_sticky_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return False
+async def _delete_tracked_previous(bot, chat_id: int) -> None:
+    state = _track(chat_id)
+    await _safe_delete_by_id(bot, chat_id, state.get("previous_user"))
+    for msg_id in list(state.get("previous_bot", [])):
+        await _safe_delete_by_id(bot, chat_id, msg_id)
+    state["previous_user"] = None
+    state["previous_bot"] = []
 
 
 def _is_file_message(message: Message | None) -> bool:
@@ -126,49 +102,26 @@ async def start_new_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat is None:
         return
-    current = get_current_pair(chat.id)
+    state = _track(chat.id)
+    await _delete_tracked_previous(context.bot, chat.id)
 
-    if update.message is not None:
-        action_id = f"m:{update.message.message_id}"
-        if current.get("action_id") == action_id:
-            return
-        await delete_previous_pair(context.bot, chat.id)
-        prev = _pair_clone(current)
-        if prev.get("action_id"):
-            PREVIOUS_PAIRS[chat.id] = prev
-        keep_user_message = not _is_file_message(update.message)
-        CURRENT_PAIRS[chat.id] = {
-            "action_id": action_id,
-            "user_message_id": update.message.message_id if keep_user_message else None,
-            "bot_message_ids": [],
-            "sticky": should_sticky_action(update, context),
-        }
-        return
+    # shift current pair to previous pair
+    state["previous_user"] = state.get("current_user")
+    state["previous_bot"] = list(state.get("current_bot", []))
+    state["current_user"] = None
+    state["current_bot"] = []
 
-    if update.callback_query is not None:
-        action_id = f"c:{update.callback_query.id}"
-        if current.get("action_id") == action_id:
-            return
-        await delete_previous_pair(context.bot, chat.id)
-        prev = _pair_clone(current)
-        if prev.get("action_id"):
-            PREVIOUS_PAIRS[chat.id] = prev
-        source_message_id = update.callback_query.message.message_id if update.callback_query.message else None
-        CURRENT_PAIRS[chat.id] = {
-            "action_id": action_id,
-            "user_message_id": None,
-            "bot_message_ids": [source_message_id] if source_message_id else [],
-            "sticky": False,
-        }
-        if source_message_id:
-            remember_active_ui(chat.id, source_message_id)
+    if update.message is not None and not _is_file_message(update.message):
+        state["current_user"] = update.message.message_id
+    elif update.callback_query is not None and update.callback_query.message is not None:
+        state["current_bot"] = [update.callback_query.message.message_id]
+        remember_active_ui(chat.id, update.callback_query.message.message_id)
 
 
 def append_pair_bot_message(chat_id: int, message_id: int) -> None:
-    pair = get_current_pair(chat_id)
-    ids = pair.setdefault("bot_message_ids", [])
-    if message_id not in ids:
-        ids.append(message_id)
+    state = _track(chat_id)
+    if message_id not in state["current_bot"]:
+        state["current_bot"].append(message_id)
 
 
 async def _compact_reply_text(self: Message, *args, **kwargs):
@@ -176,24 +129,20 @@ async def _compact_reply_text(self: Message, *args, **kwargs):
     if chat is None:
         return await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
 
-    action_id = f"m:{self.message_id}"
-    pair = get_current_pair(chat.id)
-    if pair.get("action_id") != action_id:
-        await delete_previous_pair(self.get_bot(), chat.id)
-        prev = _pair_clone(pair)
-        if prev.get("action_id"):
-            PREVIOUS_PAIRS[chat.id] = prev
-        keep_user_message = not _is_file_message(self)
-        CURRENT_PAIRS[chat.id] = {
-            "action_id": action_id,
-            "user_message_id": self.message_id if keep_user_message else None,
-            "bot_message_ids": [],
-            "sticky": False,
-        }
+    if not _is_file_message(self):
+        state = _track(chat.id)
+        # if reply_text is called without ui_send/start_new_action, make this message the current user action
+        if state.get("current_user") != self.message_id:
+            await _delete_tracked_previous(self.get_bot(), chat.id)
+            state["previous_user"] = state.get("current_user")
+            state["previous_bot"] = list(state.get("current_bot", []))
+            state["current_user"] = self.message_id
+            state["current_bot"] = []
 
     sent = await _ORIGINAL_MESSAGE_REPLY_TEXT(self, *args, **kwargs)
-    append_pair_bot_message(chat.id, sent.message_id)
-    remember_active_ui(chat.id, sent.message_id)
+    if not _is_file_message(sent):
+        append_pair_bot_message(chat.id, sent.message_id)
+        remember_active_ui(chat.id, sent.message_id)
     return sent
 
 
