@@ -1941,7 +1941,7 @@ async def ensure_owner_access(update: Update) -> bool:
     if OWNER_USER_ID is not None and user.id != OWNER_USER_ID:
         text = 'Эта команда доступна только владельцу бота.'
         if update.message:
-            await ui_send(update, context, text, reply_markup=MENU, force_new=True)
+            await ui_send(update, context, text, reply_markup=MENU)
         elif update.callback_query:
             await update.callback_query.answer(text, show_alert=True)
         return False
@@ -1976,7 +1976,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if not store.subscriptions:
         message += "\n\nДля быстрого теста можешь запустить /demo."
-    await ui_send(update, context, message, reply_markup=MENU, force_new=True)
+    await ui_send(update, context, message, reply_markup=MENU)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2009,7 +2009,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/demo — добавить демо-набор подписок\n"
         "/cancel — отменить текущий диалог"
     )
-    await ui_send(update, context, text, reply_markup=MENU, force_new=True)
+    await ui_send(update, context, text, reply_markup=MENU)
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2019,7 +2019,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if not USER_ACTIVITY_LOG:
-        await update.message.reply_text("Пока нет данных по пользователям.", reply_markup=MENU)
+        await ui_send(update, context, "Пока нет данных по пользователям.", reply_markup=MENU)
         return
 
     activities = sorted(
@@ -2952,9 +2952,9 @@ async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat = update.effective_chat
     store = get_store(user.id, chat.id if chat else None)
     if not store.archived_subscriptions:
-        await update.message.reply_text('Архив пуст.', reply_markup=MENU)
+        await ui_send(update, context, 'Архив пуст.', reply_markup=MENU)
         return
-    await update.message.reply_text(f'В архиве: {len(store.archived_subscriptions)}', reply_markup=MENU)
+    await ui_send(update, context, f'В архиве: {len(store.archived_subscriptions)}', reply_markup=MENU)
     for subscription in sorted(store.archived_subscriptions.values(), key=lambda item: item.name.lower()):
         await update.message.reply_text(
             render_subscription(subscription),
@@ -2998,7 +2998,7 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def year_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
-    await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard(), force_new=True)
+    await ui_send(update, context, 'Выбери месяц. Я покажу прогнозируемые события на него.', reply_markup=build_year_month_keyboard())
 
 
 async def year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
